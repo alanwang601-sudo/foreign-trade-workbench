@@ -1,0 +1,1 @@
+{"name": "外贸工作台", "short_name": "外贸工作台", "description": "AI获客 + CRM · 外贸客户开发与管理工具", "start_url": "./index.html", "display": "standalone", "background_color": "#0f172a", "theme_color": "#4f46e5", "orientation": "any", "icons": [{"src": "./icon-192.png", "sizes": "192x192", "type": "image/png"}, {"src": "./icon-512.png", "sizes": "512x512", "type": "image/png"}]}

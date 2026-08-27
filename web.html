@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#4f46e5" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>外贸工作台 · Web版</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- 侧边栏 -->
+    <aside id="sidebar">
+      <div class="brand">
+        <div class="brand-logo">FT</div>
+        <div class="brand-text">
+          <div class="brand-name">外贸工作台</div>
+          <div class="brand-sub">Web版 · 浏览器运行</div>
+        </div>
+      </div>
+      <nav id="nav">
+        <a class="nav-item" data-view="dashboard"><span class="nav-ico">▦</span>工作台</a>
+        <a class="nav-item" data-view="lead"><span class="nav-ico">✦</span>智能开发</a>
+        <a class="nav-item" data-view="research"><span class="nav-ico">🔍</span>深度背调</a>
+        <a class="nav-item" data-view="market"><span class="nav-ico">📊</span>市场分析</a>
+        <a class="nav-item" data-view="crm"><span class="nav-ico">👥</span>客户管理</a>
+        <a class="nav-item" data-view="calendar"><span class="nav-ico">📅</span>日历</a>
+        <a class="nav-item" data-view="settings"><span class="nav-ico">⚙</span>设置</a>
+      </nav>
+      <div class="sidebar-foot">
+        <div id="ai-status" class="ai-status">AI：未配置</div>
+      </div>
+    </aside>
+
+    <!-- 主区域 -->
+    <div id="content">
+      <header id="topbar">
+        <div class="topbar-actions" style="flex:1;display:flex;align-items:center">
+          <button id="menu-toggle" title="菜单">☰</button>
+          <div class="topbar-title" id="page-title">工作台</div>
+        </div>
+        <div class="topbar-actions">
+          <input id="global-search" class="search-input" type="text" placeholder="搜索客户 / 公司…" />
+          <button id="theme-toggle" class="icon-btn" title="切换主题">🌓</button>
+        </div>
+      </header>
+      <main id="main"></main>
+    </div>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+  <div class="sidebar-overlay" id="sidebar-overlay"></div>
+
+  <!-- Web 版本：引用 web.js（纯前端，无需 Electron） -->
+  <script src="web.js" defer></script>
+  <!-- 实时同步模块：Supabase(推荐) + CloudBase NoSQL + 注入补丁（在 web.js 之后加载） -->
+  <script src="sb-sync.js" defer></script>
+  <script src="pg-sync.js" defer></script>
+  <script src="cloudbase-patch.js" defer></script>
+</body>
+</html>
