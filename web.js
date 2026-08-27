@@ -2220,6 +2220,8 @@ function renderCalendar() {
   const doneTodos = todosInMonth.filter(t => t.done);
   // 全部未完成待办（列表区用）
   const allOpenTodos = (state.calendar.todos || []).filter(t => !t.done);
+  // 全部已完成待办（折叠展示，避免"事项消失"的错觉）
+  const allDoneTodos = (state.calendar.todos || []).filter(t => t.done);
 
   // 生成日历格
   let cells = '';
@@ -2259,6 +2261,18 @@ function renderCalendar() {
       <button class="icon-btn sm cal-todo-edit" data-id="${t.id}" title="编辑">✎</button>
       <button class="icon-btn sm cal-todo-del" data-id="${t.id}" title="删除">✕</button>
     </div>`).join('') || '<div class="empty small">暂无待办，点击右上角"添加待办"</div>';
+
+  // 已完成待办列表（折叠展示，倒序 = 最近完成的在最上）
+  const doneListHtml = allDoneTodos.slice().sort((a, b) => (b.doneAt || b.updatedAt || '').localeCompare(a.doneAt || a.updatedAt || '')).map(t => `
+    <div class="cal-todo-item done ${t.prio ? 'prio' + t.prio : ''}" data-todo="${t.id}">
+      <label class="check" style="flex:1;min-width:0">
+        <input type="checkbox" class="cal-todo-done" data-id="${t.id}" checked>
+        <span class="cal-todo-text" style="text-decoration:line-through;opacity:.6">${esc(t.text)}${t.custId ? `<a class="cal-todo-cust" data-cust="${esc(t.custId)}" title="打开客户跟进记录">👤 ${esc(t.custName || '客户')}</a>` : ''}</span>
+      </label>
+      <span class="cal-todo-date">${t.date ? t.date.slice(5) : '未设'}</span>
+      <button class="icon-btn sm cal-todo-edit" data-id="${t.id}" title="编辑">✎</button>
+      <button class="icon-btn sm cal-todo-del" data-id="${t.id}" title="删除">✕</button>
+    </div>`).join('') || '<div class="empty small">暂无已完成事项</div>';
 
   // 本月自定义节日
   const customInMonth = (state.calendar.customHolidays || []).filter(h => h.m === m);
@@ -2300,6 +2314,10 @@ function renderCalendar() {
         </div>
         <div class="cal-todo-list">${todoListHtml}</div>
         <div class="small muted mt8">本月：${openTodos.length} 未完成 · ${doneTodos.length} 已完成</div>
+        ${allDoneTodos.length ? `<details class="cal-done-details" ${state.calDoneOpen ? 'open' : ''}>
+          <summary class="cal-done-summary">✅ 已完成（${allDoneTodos.length}）<span class="muted small">点击展开</span></summary>
+          <div class="cal-todo-list cal-done-list">${doneListHtml}</div>
+        </details>` : ''}
       </div>
 
       <div class="card card-pad mb12">
@@ -2357,6 +2375,7 @@ function renderCalendar() {
     if (t) {
       const wasDone = t.done;
       t.done = cb.checked;
+      t.doneAt = cb.checked ? nowISO() : '';
       t.updatedAt = nowISO();
       // 勾选完成 + 关联了客户 → 自动往客户跟进记录追加备注（仅首次完成时写入，取消后再勾选不重复）
       if (cb.checked && !wasDone && t.custId && !t.custNotedAt) {
@@ -2441,7 +2460,8 @@ function noteTodoToCustomer(t) {
 function calAddTodo(defaultDate, editId) {
   const t = editId ? (state.calendar.todos.find(x => x.id === editId) || null) : null;
   const d = t ? (t.date || '') : (defaultDate || '');
-  const custOpts = (state.customers || []).map(c => `<option value="${esc(c.id)}" ${t && t.custId === c.id ? 'selected' : ''}>${esc(c.name)}${c.country ? '（' + esc(c.country) + '）' : ''}</option>`).join('');
+  // datalist 候选：value 用客户名称，便于按名称搜索匹配（国别作辅助提示）
+  const custOpts = (state.customers || []).sort((a, b) => (a.name || '').localeCompare(b.name || '')).map(c => `<option value="${esc(c.name)}">${esc(c.country ? '📍' + c.country : '')}${esc(c.industry || '')}${c.cooperating ? ' [已合作]' : ''}</option>`).join('');
   showModal(`
     <div class="field"><label>待办内容 <span class="req">*</span></label><input id="ct-text" type="text" value="${esc(t ? t.text : '')}" placeholder="如：给美国客户发感恩节问候"></div>
     <div class="row2">
@@ -2454,11 +2474,11 @@ function calAddTodo(defaultDate, editId) {
         </select>
       </div>
     </div>
-    <div class="field"><label>关联客户 <span class="muted small">（可选，完成后自动备注到该客户跟进记录）</span></label>
-      <select id="ct-cust">
-        <option value="">— 不关联客户 —</option>
-        ${custOpts}
-      </select>
+    <div class="field"><label>关联客户 <span class="muted small">（输入客户名称搜索，可选；完成后自动备注到该客户跟进记录）</span></label>
+      <input id="ct-cust" list="ct-cust-list" placeholder="输入客户名称搜索，或从下拉选择…" value="${esc(t && t.custId ? (t.custName || '') : '')}" autocomplete="off">
+      <input type="hidden" id="ct-cust-id" value="${esc(t && t.custId ? t.custId : '')}">
+      <datalist id="ct-cust-list">${custOpts}</datalist>
+      <div class="small muted mt4">已关联：<span id="ct-cust-display">${t && t.custName ? esc(t.custName) : '未关联客户'}</span></div>
     </div>
     <div class="field"><label>备注</label><textarea id="ct-note" placeholder="可选">${esc(t ? (t.note || '') : '')}</textarea></div>
     <div class="help" style="margin-top:6px">到期当天打开应用会弹窗提醒；勾选完成时，若已关联客户，将自动在客户 CRM 的「跟进记录」里追加一条备注。</div>
@@ -2469,8 +2489,21 @@ function calAddTodo(defaultDate, editId) {
     const text = $('#ct-text').value.trim();
     const date = $('#ct-date').value;
     const prio = Number($('#ct-prio').value || 0);
-    const custId = $('#ct-cust').value || '';
-    const custName = custId ? ((state.customers.find(c => c.id === custId) || {}).name || '') : '';
+    // 关联客户：datalist 用"客户名称"作为候选值，输入名称后按名称精确匹配；同时兼容隐藏的 id（若用户未改则沿用）
+    const custNameInput = $('#ct-cust').value.trim();
+    let custId = '';
+    let custName = '';
+    if (custNameInput) {
+      const matched = (state.customers || []).find(c => c.name === custNameInput);
+      if (matched) { custId = matched.id; custName = matched.name; }
+      else {
+        // 名称不精确匹配时，尝试用已保存的隐藏 id（编辑未改名场景）
+        const hid = $('#ct-cust-id').value;
+        const hidCust = hid ? (state.customers.find(c => c.id === hid) || null) : null;
+        if (hidCust && hidCust.name === custNameInput) { custId = hid; custName = hidCust.name; }
+        else toast('提示', '未找到客户「' + custNameInput + '」，请从下拉列表中选择', 'warn');
+      }
+    }
     const note = $('#ct-note').value.trim();
     if (!text) { toast('提示', '请输入待办内容', 'warn'); return; }
     if (!date) { toast('提示', '请选择日期', 'warn'); return; }
@@ -2516,6 +2549,8 @@ function calAddHoliday(y, m) {
 
 // 同步日历数据到云端（接入 CloudBase）
 function syncCal() {
+  // 关键：每次日历数据变化都刷新本地 updatedAt，避免云端旧数据覆盖本地新待办
+  state.calendar.updatedAt = nowISO();
   try { if (window.__ftCloud && window.__ftCloud.pushCalendar) window.__ftCloud.pushCalendar(); } catch (e) {}
 }
 

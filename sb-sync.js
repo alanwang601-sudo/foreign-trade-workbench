@@ -201,9 +201,37 @@
       if (calRes.ok && Array.isArray(calRes.records) && calRes.records.length) {
         const calRec = calRes.records.find(r => r.id === 'ftw_calendar');
         if (calRec) {
-          const t1 = new Date((st.calendar && st.calendar.updatedAt) || 0).getTime();
+          const local = st.calendar || { todos: [], customHolidays: [] };
+          const t1 = new Date((local.updatedAt) || 0).getTime();
           const t2 = new Date(calRec.updatedAt || 0).getTime();
-          if (t2 >= t1) st.calendar = { todos: [], customHolidays: [], ...calRec };
+          // 云端比本地新时才采纳云端；否则保留本地（本地可能刚新增/勾选完成尚未推送）
+          if (t2 > t1) {
+            // 采纳云端，但合并待办（按 id 取 updatedAt 较新者），避免吞掉本地新增/完成状态
+            const cloudCal = { todos: [], customHolidays: [], ...calRec };
+            const localTodos = local.todos || [];
+            const cloudTodos = cloudCal.todos || [];
+            const byId = new Map();
+            localTodos.forEach(t => byId.set(t.id, t));
+            cloudTodos.forEach(t => {
+              if (!t || !t.id) return;
+              const l = byId.get(t.id);
+              if (l) {
+                const lt = new Date(l.updatedAt || 0).getTime();
+                const ct = new Date(t.updatedAt || 0).getTime();
+                byId.set(t.id, ct >= lt ? t : l);
+              } else byId.set(t.id, t);
+            });
+            cloudCal.todos = Array.from(byId.values());
+            // 节日也合并（保留本地云端都有的）
+            const lHol = local.customHolidays || [];
+            const cHol = cloudCal.customHolidays || [];
+            const holMap = new Map(lHol.map(h => [h.id, h]));
+            cHol.forEach(h => { if (h && h.id) holMap.set(h.id, h); });
+            cloudCal.customHolidays = Array.from(holMap.values());
+            // 合并后时间戳取两者较新
+            cloudCal.updatedAt = new Date(Math.max(t1, t2)).toISOString();
+            st.calendar = cloudCal;
+          }
         }
       }
       const setRes = await pullTable('settings');
