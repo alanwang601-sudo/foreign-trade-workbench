@@ -1,6 +1,6 @@
 /* 外贸工作台 Web 版 Service Worker
  * 提供离线缓存，让"添加到主屏幕"的 App 在无网络时也能打开 */
-const CACHE = 'ftw-cache-v6';
+const CACHE = 'ftw-cache-v7';
 const ASSETS = [
   './',
   './index.html',

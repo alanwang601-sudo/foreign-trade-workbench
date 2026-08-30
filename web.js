@@ -1337,19 +1337,60 @@ function openDeepResearch(lead) {
     .catch(e => { host.innerHTML = `<div class="empty"><div class="big">⚠</div>背调失败：${esc(e.message)}</div>`; });
 }
 
+// ---------- 统一的联系人提取：兼容各种 AI 返回格式 ----------
+// 支持：contacts / contact / contact_persons / people / decision_makers / key_contacts
+// 值可以是「对象数组」「单个对象」，字段名兼容多种命名
+function extractContactsFrom(raw) {
+  if (!raw || typeof raw !== 'object') return [];
+  const KEYS = ['contacts', 'contact', 'contact_persons', 'contactPersons', 'people', 'decision_makers', 'decisionMakers', 'key_contacts', 'keyContacts', 'persons'];
+  let arr = null;
+  for (const k of KEYS) {
+    if (raw[k] == null) continue;
+    const v = raw[k];
+    if (Array.isArray(v)) { arr = v; break; }
+    if (typeof v === 'object') { arr = [v]; break; }
+  }
+  // 兜底：如果顶层就是数组
+  if (!arr && Array.isArray(raw)) arr = raw;
+  if (!arr || !arr.length) return [];
+  const pick = (o, names) => {
+    for (const n of names) {
+      if (o[n] != null && String(o[n]).trim()) return String(o[n]).trim();
+    }
+    return '';
+  };
+  const out = [];
+  arr.forEach(k => {
+    if (!k) return;
+    // 支持字符串形式（如 "John - CEO - john@x.com"）
+    if (typeof k === 'string') {
+      const email = (k.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/) || [''])[0];
+      const phone = (k.match(/\+?\d[\d\s\-().]{6,}\d/) || [''])[0];
+      const name = k.split(/[-–—|,，]/)[0].trim();
+      if (name || email || phone) out.push({ name: name && name.length < 40 ? name : '', title: '', email, phone: phone.trim() });
+      return;
+    }
+    if (typeof k !== 'object') return;
+    const name = pick(k, ['name', 'contact_name', 'contactName', 'full_name', 'fullName', 'person', '姓名']);
+    const title = pick(k, ['title', 'position', 'role', 'job_title', 'jobTitle', 'designation', '职位']);
+    const email = pick(k, ['email', 'email_address', 'emailAddress', 'mail', 'e_mail', '邮箱']);
+    const phone = pick(k, ['phone', 'tel', 'telephone', 'phone_number', 'phoneNumber', 'mobile', 'cell', '电话']);
+    if (name || email || phone || title) out.push({ name, title, email, phone });
+  });
+  return out;
+}
+
 // 从背调报告里提取联系人：
 // 1) AI 返回的 contacts 数组（每项 {name, title, email, phone}）
 // 2) 全文里用正则提取邮箱/电话/可能的姓名
 function collectContactsFromResearch(r, companyName) {
   const source = [];
   const contacts = [];
-  // 1) AI 返回的 contacts
-  if (Array.isArray(r.contacts) && r.contacts.length) {
-    r.contacts.forEach(k => {
-      if (!k || typeof k !== 'object') return;
-      if (k.name || k.email || k.phone) contacts.push({ name: k.name || '', title: k.title || '', email: k.email || '', phone: k.phone || '' });
-    });
-    if (contacts.length) source.push('AI 返回');
+  // 1) AI 返回的 contacts（统一用 extractContactsFrom，兼容单数/复数/各种字段名）
+  const fromAI = extractContactsFrom(r);
+  if (fromAI.length) {
+    fromAI.forEach(k => contacts.push({ name: k.name || '', title: k.title || '', email: k.email || '', phone: k.phone || '' }));
+    source.push('AI 返回');
   }
   // 2) 全文正则：把报告所有文本拼一起扫
   const fullText = [r.overview, r.strengths, r.risks, r.creditHint, r.suggestedApproach, r.markets, r.products, r.size].filter(x => typeof x === 'string').join('\n') + ' ' + (companyName || '');
@@ -2028,29 +2069,21 @@ function openCustomerForm(id) {
       obj.tags.forEach(t => { if (typeof t === 'string' && !tagArr.includes(t)) tagArr.push(t); });
       refreshTags();
     }
-    // 联系人：contact 是对象 → 填入第一个联系人行；contact 是数组 → 全部填入
-    if (obj.contact) {
-      const fillFirstContact = (k) => {
-        const row = $('#f-contacts > div');
-        if (!row) return;
-        if (k.name) { const el = $('[data-c="name"]', row); if (el) el.value = k.name; }
-        if (k.title) { const el = $('[data-c="title"]', row); if (el) el.value = k.title; }
-        if (k.email) { const el = $('[data-c="email"]', row); if (el) el.value = k.email; }
-        if (k.phone) { const el = $('[data-c="phone"]', row); if (el) el.value = k.phone; }
-      };
-      if (Array.isArray(obj.contact)) {
-        // 替换为前 N 个联系人行
-        const box = $('#f-contacts');
+    // 联系人：统一用 extractContactsFrom，支持 contacts/contact（单复数）、各种字段名
+    const contacts = extractContactsFrom(obj);
+    if (contacts.length) {
+      const box = $('#f-contacts');
+      if (box) {
         box.innerHTML = '';
-        obj.contact.forEach(k => {
-          const tmp = document.createElement('div'); tmp.innerHTML = contactRow(k); box.appendChild(tmp.firstElementChild);
+        contacts.forEach(k => {
+          const tmp = document.createElement('div');
+          tmp.innerHTML = contactRow(k);
+          box.appendChild(tmp.firstElementChild);
         });
-      } else {
-        fillFirstContact(obj.contact);
       }
     }
     const filled = ['f-name', 'f-country', 'f-website', 'f-industry'].filter(id => $('#' + id) && $('#' + id).value).length;
-    toast('✓ 已填充', `共 ${filled} 个核心字段 + ${tagArr.length} 标签` + (obj.contact ? ' + 联系人' : ''), 'ok');
+    toast('✓ 已填充', `共 ${filled} 个核心字段 + ${tagArr.length} 标签` + (contacts.length ? ` + ${contacts.length} 个联系人` : ''), 'ok');
   });
 
   $('#f-add-contact').addEventListener('click', () => {
@@ -2996,7 +3029,7 @@ function renderSettings() {
       webdavLastSync: state.settings.webdavLastSync || ''
     };
     const r = await setConfigWeb(cfg);
-    if (r.ok) { state.settings = r.config; updateAiStatus(); toast('已保存', '配置已写入本机', 'ok'); $('#st-msg').textContent = '✓ 配置已保存'; $('#st-msg').style.color = 'var(--success)'; syncSettings(); }
+    if (r.ok) { state.settings = r.config; updateAiStatus(); toast('已保存', '配置已写入本机', 'ok'); syncSettings(); render(); const m = $('#st-msg'); if (m) { m.textContent = '✓ 配置已保存（含评级跟进频率）'; m.style.color = 'var(--success)'; } }
     else toast('保存失败', '', 'err');
   });
 
