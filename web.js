@@ -134,9 +134,20 @@ function addDaysStr(dateStr, days) {
   d.setDate(d.getDate() + days);
   return toDateStr(d);
 }
+// 客户评级（rating）与各等级对应的默认跟进周期
+// 优先级：c.followUpEvery（自定义） > ratingDays[c.rating]（评级默认） > state.settings.followUpDays（全局默认）
+const RATINGS = ['A+', 'A', 'B', 'C'];
+const RATING_DAYS_DEFAULT = { 'A+': 3, 'A': 7, 'B': 14, 'C': 30 };
+function ratingDays(rating) {
+  const s = (state.settings && state.settings.ratingDays) || {};
+  return s[rating] != null ? s[rating] : (RATING_DAYS_DEFAULT[rating] || 0);
+}
 // 计算单个客户的跟进状态：下次应跟进日期、是否已逾期、逾期天数
 function followUpInfo(c) {
-  const interval = (c.followUpEvery && c.followUpEvery > 0) ? c.followUpEvery : (state.settings.followUpDays || 14);
+  let interval = 0;
+  if (c.followUpEvery && c.followUpEvery > 0) interval = c.followUpEvery;
+  else if (c.rating && ratingDays(c.rating)) interval = ratingDays(c.rating);
+  if (!interval) interval = (state.settings.followUpDays || 14);
   const base = (c.lastFollowUp && /^\d{4}-\d{2}-\d{2}/.test(c.lastFollowUp)) ? c.lastFollowUp.slice(0, 10)
     : (c.createdAt ? c.createdAt.slice(0, 10) : null);
   if (!base) return { next: null, due: true, interval, daysOverdue: null, base: null };
@@ -471,7 +482,7 @@ const SYS_OEM = '你是一名资深汽车配件（滤清器 / OEM 件）外贸�
 
 const SYS_RESEARCH = '你是一名外贸客户背调专家，擅长通过公开信息评估海外买家。基于公司名/官网输出结构化背调报告。' +
   '只返回 JSON，不要任何额外文字或 markdown 代码块。格式：' +
-  '{"overview":"公司概况","country":"国别/地区（如：德国、美国、东南亚）","industry":"行业（如：汽配、户外用品、建材）","size":"规模(营收/人数估计)","products":"主营产品","markets":"目标市场与渠道","strengths":"优势","risks":"风险与警示","creditHint":"信用/资质提示","suggestedApproach":"开发建议","sources":["信息来源"]}';
+  '{"overview":"公司概况","country":"国别/地区（如：德国、美国、东南亚）","industry":"行业（如：汽配、户外用品、建材）","size":"规模(营收/人数估计)","products":"主营产品","markets":"目标市场与渠道","strengths":"优势","risks":"风险与警示","creditHint":"信用/资质提示","suggestedApproach":"开发建议","sources":["信息来源"],"contacts":[{"name":"姓名","title":"职位/头衔","email":"邮箱","phone":"电话"}]}';
 const SYS_MARKET = '你是一名国际市场分析专家，为外贸企业提供进入某市场的决策分析。' +
   '只返回 JSON，不要任何额外文字或 markdown 代码块。格式：' +
   '{"summary":"总体结论","marketSize":"市场规模估计","trends":["趋势"],"competitors":["竞争者/替代渠道"],"entryStrategy":["进入策略"],"risks":["风险"],"chartData":{"labels":["维度名"],"values":[0到100的机会/吸引力评分]}}';
@@ -1326,11 +1337,65 @@ function openDeepResearch(lead) {
     .catch(e => { host.innerHTML = `<div class="empty"><div class="big">⚠</div>背调失败：${esc(e.message)}</div>`; });
 }
 
+// 从背调报告里提取联系人：
+// 1) AI 返回的 contacts 数组（每项 {name, title, email, phone}）
+// 2) 全文里用正则提取邮箱/电话/可能的姓名
+function collectContactsFromResearch(r, companyName) {
+  const source = [];
+  const contacts = [];
+  // 1) AI 返回的 contacts
+  if (Array.isArray(r.contacts) && r.contacts.length) {
+    r.contacts.forEach(k => {
+      if (!k || typeof k !== 'object') return;
+      if (k.name || k.email || k.phone) contacts.push({ name: k.name || '', title: k.title || '', email: k.email || '', phone: k.phone || '' });
+    });
+    if (contacts.length) source.push('AI 返回');
+  }
+  // 2) 全文正则：把报告所有文本拼一起扫
+  const fullText = [r.overview, r.strengths, r.risks, r.creditHint, r.suggestedApproach, r.markets, r.products, r.size].filter(x => typeof x === 'string').join('\n') + ' ' + (companyName || '');
+  const emails = Array.from(new Set((fullText.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || [])));
+  const phones = Array.from(new Set((fullText.match(/\+?\d[\d\s\-().]{6,}\d/g) || []).map(p => p.trim())));
+  // 把已存在的 email/phone 标记出来
+  const haveEmails = new Set(contacts.map(c => c.email).filter(Boolean));
+  const havePhones = new Set(contacts.map(c => c.phone).filter(Boolean));
+  emails.filter(e => !haveEmails.has(e)).forEach(e => contacts.push({ name: '', title: '(文本中提取)', email: e, phone: '' }));
+  phones.filter(p => !havePhones.has(p)).forEach(p => contacts.push({ name: '', title: '(文本中提取)', email: '', phone: p }));
+  if (emails.length || phones.length) source.push('文本正则');
+  // 去重：name+email+phone 完全相同的去重
+  const seen = new Set();
+  const dedup = contacts.filter(k => {
+    const key = (k.name || '') + '|' + (k.email || '') + '|' + (k.phone || '');
+    if (seen.has(key)) return false;
+    seen.add(key); return true;
+  });
+  return { contacts: dedup, source };
+}
+
 // 可复用的背调报告渲染（用于"深度背调"视图与线索内联深度背调）
 function paintResearchReport(host, r, name, site) {
   const sec = (title, val) => val ? `<div class="report-section"><h4>▸ ${title}</h4><div>${esc(val)}</div></div>` : '';
   const list = (title, arr) => (arr && arr.length) ? `<div class="report-section"><h4>▸ ${title}</h4><ul>${arr.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
   const custOptions = state.customers.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
+
+  // 提取联系人：1) AI 返回的 contacts 字段；2) 全文正则扫邮箱/电话/姓名
+  const collected = collectContactsFromResearch(r, name);
+  const contactPanel = collected.contacts.length ? `
+    <div class="report-section" id="dr-contacts-panel" style="background:linear-gradient(135deg,rgba(16,185,129,0.06),rgba(99,102,241,0.06));border:1px dashed var(--success,#16a34a);border-radius:8px;padding:12px">
+      <h4>👤 检测到 ${collected.contacts.length} 个潜在联系人</h4>
+      <div class="small muted mb8">来源：${collected.source.join('、')}</div>
+      <div id="dr-contact-rows">
+        ${collected.contacts.map((k, i) => `<label class="check" style="display:flex;gap:8px;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)">
+          <input type="checkbox" class="dr-contact-pick" data-i="${i}" checked>
+          <span style="flex:1"><b>${esc(k.name || '—')}</b>${k.title ? ' · <span class="muted">' + esc(k.title) + '</span>' : ''}${k.email ? ' · <a href="mailto:' + esc(k.email) + '" style="color:var(--primary)">' + esc(k.email) + '</a>' : ''}${k.phone ? ' · <a href="tel:' + esc(k.phone) + '" style="color:var(--primary)">' + esc(k.phone) + '</a>' : ''}</span>
+        </label>`).join('')}
+      </div>
+      <div class="flex gap8 mt8">
+        <button class="btn sm primary" id="dr-add-to-new">＋ 一键填入「存为新客户」</button>
+        <button class="btn sm" id="dr-add-to-existing">👇 一键填入选中客户</button>
+        <select id="dr-cust-pick" style="flex:1"><option value="">选择要填入的现有客户…</option>${custOptions}</select>
+      </div>
+    </div>` : '';
+
   const kw = [];
   if (r.country) kw.push(['国别', r.country]);
   if (r.industry) kw.push(['行业', r.industry]);
@@ -1340,6 +1405,7 @@ function paintResearchReport(host, r, name, site) {
   host.innerHTML = `
     <div class="report-section"><h4>▸ 公司概况</h4><div><strong>${esc(name)}</strong>${site ? ` · <a href="${esc(site)}" target="_blank" style="color:var(--primary)">${esc(site)}</a>` : ''}</div></div>
     ${keywordPanel}
+    ${contactPanel}
     ${sec('规模', r.size)}
     ${sec('主营产品', r.products)}
     ${sec('目标市场与渠道', r.markets)}
@@ -1356,6 +1422,52 @@ function paintResearchReport(host, r, name, site) {
         <button class="btn" id="dr-update">更新</button>
       </div>
     </div>`;
+
+  // 联系人按钮：填入"存为新客户"（先点 ＋ 存为新客户 弹的确认框或直接创建，附加 contacts）
+  const cp = host.querySelector('#dr-contacts-panel');
+  if (cp) {
+    const pickedContacts = () => {
+      const idx = Array.from(host.querySelectorAll('.dr-contact-pick:checked')).map(c => +c.dataset.i);
+      return idx.map(i => collected.contacts[i]).filter(Boolean);
+    };
+    host.querySelector('#dr-add-to-new').addEventListener('click', () => {
+      const k = pickedContacts();
+      if (!k.length) { toast('未选择', '请至少勾选一个联系人', 'warn'); return; }
+      // 直接创建客户（不弹重复确认，除非真重复）
+      const dup = findDupCustomer(name, site, '');
+      const doCreate = () => {
+        state.customers.push({
+          id: uid(), name, website: site, country: r.country || '', industry: r.industry || '', stage: '线索', source: 'AI背调',
+          owner: '', value: 0, channel: '', shopUrl: '', cooperating: false, contacts: k, tags: ['已背调'], notes: [{ date: nowISO(), text: '完成 AI 背调，含 ' + k.length + ' 个联系人' }],
+          aiReport: r, createdAt: nowISO(), updatedAt: nowISO(), lastFollowUp: ''
+        });
+        persistAll(); toast('✓ 已新建客户并填入 ' + k.length + ' 个联系人', name, 'ok');
+      };
+      if (dup) {
+        showModal(`<div style="padding:8px 4px">检测到「<b>${esc(dup.name)}</b>」可能重复。要把联系人<strong>追加到现有客户</strong>还是仍创建新客户？</div>`, { title: '可能重复', foot: true });
+        const foot = $('#modal-foot');
+        foot.innerHTML = `<button class="btn" data-close>取消</button>
+          <button class="btn" id="dr-append-dup">追加到现有</button>
+          <button class="btn primary" id="dr-force-new2">仍创建新客户</button>`;
+        $all('[data-close]', foot).forEach(b => b.addEventListener('click', closeModal));
+        foot.querySelector('#dr-append-dup').addEventListener('click', () => { closeModal(); dup.contacts = (dup.contacts || []).concat(k); dup.updatedAt = nowISO(); if (!dup.tags.includes('已背调')) dup.tags.push('已背调'); dup.aiReport = r; persistAll(); toast('✓ 已追加 ' + k.length + ' 个联系人到「' + dup.name + '」', '', 'ok'); });
+        foot.querySelector('#dr-force-new2').addEventListener('click', () => { closeModal(); doCreate(); });
+      } else doCreate();
+    });
+    host.querySelector('#dr-add-to-existing').addEventListener('click', () => {
+      const id = host.querySelector('#dr-cust-pick').value;
+      const c = state.customers.find(x => x.id === id);
+      const k = pickedContacts();
+      if (!c) { toast('未选择', '请先在右侧下拉选择要填入的现有客户', 'warn'); return; }
+      if (!k.length) { toast('未选择', '请至少勾选一个联系人', 'warn'); return; }
+      c.contacts = (c.contacts || []).concat(k);
+      c.updatedAt = nowISO();
+      if (!c.tags.includes('已背调')) c.tags.push('已背调');
+      if (!c.aiReport) c.aiReport = r;
+      persistAll();
+      toast('✓ 已追加 ' + k.length + ' 个联系人到「' + c.name + '」', '', 'ok');
+    });
+  }
   host.querySelector('#dr-new').addEventListener('click', () => {
     // 先与 CRM 已有客户做交叉去重核对
     const dup = findDupCustomer(name, site, '');
@@ -1738,7 +1850,7 @@ function renderCrmTable() {
       return `
       <tr data-id="${c.id}" class="${due ? 'row-due' : ''}" style="cursor:pointer">
         <td class="col-sel"><input type="checkbox" class="c-sel" data-id="${c.id}" ${state.crmSel.has(c.id) ? 'checked' : ''}></td>
-        <td><strong>${esc(c.name)}</strong>${due ? ` <span class="badge b-due">🔔 需跟进${fu.daysOverdue ? ' · 逾期' + fu.daysOverdue + '天' : ''}</span>` : ''}${c.cooperating ? ` <span class="badge b-coop">🤝 合作</span>` : ''}${(c.tags && c.tags.length) || c.channel ? `<div class="pill-list mt8">${c.channel ? `<span class="chip">${esc(c.channel)}</span>` : ''}${c.tags.map(t => `<span class="chip">${esc(t)}</span>`).join('')}</div>` : ''}</td>
+        <td><strong>${esc(c.name)}</strong>${c.rating ? ` <span class="badge b-rating b-rating-${esc(c.rating)}" title="评级 ${esc(c.rating)}，每 ${ratingDays(c.rating)} 天跟进">⭐${esc(c.rating)}</span>` : ''}${due ? ` <span class="badge b-due">🔔 需跟进${fu.daysOverdue ? ' · 逾期' + fu.daysOverdue + '天' : ''}</span>` : ''}${c.cooperating ? ` <span class="badge b-coop">🤝 合作</span>` : ''}${(c.tags && c.tags.length) || c.channel ? `<div class="pill-list mt8">${c.channel ? `<span class="chip">${esc(c.channel)}</span>` : ''}${c.tags.map(t => `<span class="chip">${esc(t)}</span>`).join('')}</div>` : ''}</td>
         <td>${esc(c.country || '—')}</td>
         <td>${esc(c.industry || '—')}</td>
         <td><span class="badge ${STAGE_CLASS[c.stage] || 'b-tag'}">${esc(c.stage)}</span>${c.cooperating ? ` <span class="badge b-coop">🤝</span>` : ''}${c.fit ? ` <span class="badge ${fitClass(c.fit)}">${esc(c.fit)}</span>` : ''}</td>
@@ -1806,6 +1918,14 @@ function openCustomerForm(id) {
   const tags = (v.tags || []).map(t => `<span class="chip" data-tag="${esc(t)}">${esc(t)} <button data-deltag>×</button></span>`).join('');
 
   showModal(`
+    <div class="card card-pad mb12" style="background:linear-gradient(135deg,rgba(99,102,241,0.08),rgba(16,185,129,0.05));border:1px dashed var(--primary)">
+      <div class="card-title" style="font-size:13px">✨ AI 一键填充（粘贴 ChatGPT 输出的 JSON）</div>
+      <textarea id="f-ai-json" placeholder='把 ChatGPT 给你的 JSON 直接粘到这里，点「解析填充」自动填入所有字段。示例：{"company_name":"ABC Corp","country_region":"United States","industry":"Auto Parts","website":"https://abc.com","tags":["A+客户"],"contact":{"name":"John","title":"CEO","email":"john@abc.com","phone":"+1-555-0123"}}' style="min-height:60px;font-family:Consolas,monospace;font-size:12px"></textarea>
+      <div class="flex gap8 mt8">
+        <button class="btn sm primary" id="f-ai-parse" type="button">⚡ 解析填充</button>
+        <span class="small muted" style="align-self:center">支持字段：company_name/country_region/industry/website/owner/value/source/source_channel/tags/contact/first_quote_sent/oem等</span>
+      </div>
+    </div>
     <div class="field"><label>公司名称 <span class="req">*</span></label><input id="f-name" type="text" value="${esc(v.name)}"></div>
     <div class="row3">
       <div class="field"><label>国家 / 地区</label><input id="f-country" type="text" value="${esc(v.country)}"></div>
@@ -1825,8 +1945,17 @@ function openCustomerForm(id) {
       <div class="field"><label>店铺 / 列表链接</label><input id="f-shopurl" type="url" value="${esc(v.shopUrl || '')}" placeholder="drom 店铺页、1688 店铺等（无网站商家用）"></div>
     </div>
     <div class="row2">
-      <div class="field"><label>跟进周期（天）<span class="small muted">（留空则用设置里的默认 ${state.settings.followUpDays || 14} 天）</span></label><input id="f-follow-every" type="number" min="1" max="365" value="${v.followUpEvery || ''}" placeholder="${state.settings.followUpDays || 14}"></div>
+      <div class="field"><label>客户评级 <span class="small muted">（不同等级对应不同跟进频率：${RATINGS.map(r => r + '=' + ratingDays(r) + '天').join(' / ')}）</span></label>
+        <select id="f-rating">
+          <option value="">— 未评级 —</option>
+          ${RATINGS.map(r => `<option value="${r}" ${v.rating === r ? 'selected' : ''}>${r}（每 ${ratingDays(r)} 天跟进）</option>`).join('')}
+        </select>
+      </div>
+      <div class="field"><label>自定义跟进周期（天）<span class="small muted">（留空则用评级或全局默认）</span></label><input id="f-follow-every" type="number" min="1" max="365" value="${v.followUpEvery || ''}" placeholder="${v.rating ? ratingDays(v.rating) : (state.settings.followUpDays || 14)}"></div>
+    </div>
+    <div class="row2">
       <div class="field"><label>最近跟进日期</label><input id="f-last-follow" type="date" value="${esc(v.lastFollowUp || '')}"></div>
+      <div class="field" style="display:flex;align-items:flex-end"><span class="small muted">当前频率：<span id="f-follow-preview">${v.followUpEvery ? v.followUpEvery + '天' : (v.rating ? ratingDays(v.rating) + '天（评级' + v.rating + '）' : (state.settings.followUpDays || 14) + '天（默认）')}</span></span></div>
     </div>
     ${v.leadSource ? `<div class="field"><label>AI 线索来源说明 <span class="small muted">（AI 声称的公司/网址来源）</span></label><input id="f-lead-source" type="text" value="${esc(v.leadSource)}"></div>` : ''}
     <label class="check mt8"><input type="checkbox" id="f-cooperating" ${v.cooperating ? 'checked' : ''}> 标记为我方合作客户（已在合作 / 成交，搜索时会提醒避免重复开发）</label>
@@ -1864,12 +1993,84 @@ function openCustomerForm(id) {
   }
   bindTagInput();
 
+  // AI 解析填充：识别 ChatGPT 风格的 JSON（company_name / country_region / contact / tags 等）
+  $('#f-ai-parse').addEventListener('click', () => {
+    const raw = $('#f-ai-json').value.trim();
+    if (!raw) { toast('提示', '请先粘贴 ChatGPT 的 JSON', 'warn'); return; }
+    let obj = null;
+    // 尝试 1：直接解析
+    try { obj = JSON.parse(raw); } catch (e) {}
+    // 尝试 2：从文本中提取 ```json ... ``` 或 第一个 {...}
+    if (!obj) {
+      const m = raw.match(/```(?:json)?\s*([\s\S]*?)```/) || raw.match(/(\{[\s\S]*\})/);
+      if (m) { try { obj = JSON.parse(m[1]); } catch (e) {} }
+    }
+    if (!obj || typeof obj !== 'object') { toast('解析失败', '未找到合法 JSON，请检查格式', 'err'); return; }
+    const set = (id, val) => { const el = $('#' + id); if (el && val != null && val !== '' && !el.value) el.value = val; };
+    const setIf = (id, val) => { const el = $('#' + id); if (el && val != null && val !== '') el.value = val; };
+    // 顶层字段（兼容多种命名风格）
+    setIf('f-name', obj.company_name || obj.name || obj.companyName);
+    setIf('f-country', obj.country_region || obj.country || obj.countryRegion);
+    setIf('f-industry', obj.industry);
+    setIf('f-website', obj.website || obj.url || obj.homepage);
+    setIf('f-owner', obj.owner);
+    setIf('f-value', obj.estimated_value != null ? obj.estimated_value : obj.value);
+    setIf('f-source', obj.source || obj.source_channel || obj.leadSource);
+    setIf('f-channel', obj.source_channel || obj.channel);
+    setIf('f-shopurl', obj.store_listing_url || obj.shopUrl || obj.shop_url);
+    if (obj.followup_days || obj.followUpDays) { setIf('f-follow-every', obj.followup_days || obj.followUpDays); }
+    if (obj.last_followup_date || obj.lastFollowUp) { setIf('f-last-follow', obj.last_followup_date || obj.lastFollowUp); }
+    if (obj.oem_number) { const el = $('#f-oem-number'); if (el && !el.value) el.value = obj.oem_number; }
+    if (obj.oem_fit_brands) { setIf('f-oem-fit', obj.oem_fit_brands); }
+    if (obj.market_main_brands) { setIf('f-market-brands', obj.market_main_brands); }
+    // 标签
+    if (Array.isArray(obj.tags)) {
+      obj.tags.forEach(t => { if (typeof t === 'string' && !tagArr.includes(t)) tagArr.push(t); });
+      refreshTags();
+    }
+    // 联系人：contact 是对象 → 填入第一个联系人行；contact 是数组 → 全部填入
+    if (obj.contact) {
+      const fillFirstContact = (k) => {
+        const row = $('#f-contacts > div');
+        if (!row) return;
+        if (k.name) { const el = $('[data-c="name"]', row); if (el) el.value = k.name; }
+        if (k.title) { const el = $('[data-c="title"]', row); if (el) el.value = k.title; }
+        if (k.email) { const el = $('[data-c="email"]', row); if (el) el.value = k.email; }
+        if (k.phone) { const el = $('[data-c="phone"]', row); if (el) el.value = k.phone; }
+      };
+      if (Array.isArray(obj.contact)) {
+        // 替换为前 N 个联系人行
+        const box = $('#f-contacts');
+        box.innerHTML = '';
+        obj.contact.forEach(k => {
+          const tmp = document.createElement('div'); tmp.innerHTML = contactRow(k); box.appendChild(tmp.firstElementChild);
+        });
+      } else {
+        fillFirstContact(obj.contact);
+      }
+    }
+    const filled = ['f-name', 'f-country', 'f-website', 'f-industry'].filter(id => $('#' + id) && $('#' + id).value).length;
+    toast('✓ 已填充', `共 ${filled} 个核心字段 + ${tagArr.length} 标签` + (obj.contact ? ' + 联系人' : ''), 'ok');
+  });
+
   $('#f-add-contact').addEventListener('click', () => {
     const box = $('#f-contacts');
     const tmp = document.createElement('div'); tmp.innerHTML = contactRow({}); box.appendChild(tmp.firstElementChild);
     bindContact(box.lastElementChild);
   });
   $all('#f-contacts > div').forEach(bindContact);
+
+  // 评级/周期变化时实时更新预览
+  const updPreview = () => {
+    const r = $('#f-rating').value;
+    const fe = parseInt($('#f-follow-every').value, 10) || 0;
+    const txt = fe ? fe + '天（自定义）' : (r ? ratingDays(r) + '天（评级' + r + '）' : (state.settings.followUpDays || 14) + '天（默认）');
+    const pv = $('#f-follow-preview'); if (pv) pv.textContent = txt;
+  };
+  const ratingEl = $('#f-rating');
+  if (ratingEl) ratingEl.addEventListener('change', updPreview);
+  const feEl = $('#f-follow-every');
+  if (feEl) feEl.addEventListener('input', updPreview);
 
   $('#f-save').addEventListener('click', () => {
     const name = $('#f-name').value.trim();
@@ -1892,6 +2093,7 @@ function openCustomerForm(id) {
       industry: $('#f-industry').value.trim(), stage: $('#f-stage').value, owner: $('#f-owner').value.trim(),
       value: parseFloat($('#f-value').value) || 0,       source: $('#f-source').value.trim(),
       channel: $('#f-channel').value.trim(), shopUrl, cooperating: $('#f-cooperating').checked,
+      rating: ($('#f-rating') && $('#f-rating').value) || '',
       followUpEvery: parseInt($('#f-follow-every').value, 10) || 0,
       lastFollowUp: ($('#f-last-follow') ? $('#f-last-follow').value : (c && c.lastFollowUp) || ''),
       contacts, tags: tagArr,
@@ -2706,7 +2908,12 @@ function renderSettings() {
     <div class="card card-pad">
       <div class="card-title">🔔 跟进提醒</div>
       <div class="field"><label>默认跟进周期（天）</label><input id="st-followup-days" type="number" min="1" max="365" value="${s.followUpDays || 14}"></div>
-      <div class="help">超过该周期未跟进的客户，会在「客户管理」标红提醒，并可一键筛选「仅看需跟进」。"流失"阶段和"已合作"客户不计入提醒。每个客户也可在编辑时单独设置跟进周期覆盖默认值。</div>
+      <div class="field"><label>各评级对应的跟进频率（天）<span class="small muted">（可调，越重要的客户频率越高）</span></label>
+        <div class="row4">
+          ${RATINGS.map(r => `<div class="field"><label>⭐${r}</label><input type="number" min="1" max="365" data-st-rating="${r}" value="${(s.ratingDays && s.ratingDays[r]) != null ? s.ratingDays[r] : RATING_DAYS_DEFAULT[r]}"></div>`).join('')}
+        </div>
+      </div>
+      <div class="help">超过周期未跟进的客户会在「客户管理」标红提醒，并可一键筛选「仅看需跟进」。"流失"和"已合作"客户不计入提醒。**优先级**：每客户自定义 > 评级频率 > 全局默认。</div>
     </div>
     <!-- Supabase 免费云同步卡片（推荐，最简单） -->
     <div class="card card-pad" style="border:2px solid var(--success,#16a34a);border-left:6px solid var(--success,#16a34a)">
@@ -2781,6 +2988,7 @@ function renderSettings() {
       strictLeadMode: $('#st-strict').checked,
       enrichContacts: $('#st-enrich').checked,
       followUpDays: parseInt($('#st-followup-days').value, 10) || 14,
+      ratingDays: Object.assign({}, RATING_DAYS_DEFAULT, $all('[data-st-rating]').reduce((a, el) => { a[el.dataset.stRating] = parseInt(el.value, 10) || RATING_DAYS_DEFAULT[el.dataset.stRating] || 14; return a; }, {})),
       webdavUrl: $('#st-webdav-url').value.trim(),
       webdavUser: $('#st-webdav-user').value.trim(),
       webdavPass: $('#st-webdav-pass').value.trim(),

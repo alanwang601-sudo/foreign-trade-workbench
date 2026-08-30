@@ -54,18 +54,22 @@
     if (url) SB.url = url.trim().replace(/\/+$/, '');
     if (key) SB.key = key.trim();
     if (!SB.url || !SB.key) return { ok: false, error: '未配置 Supabase URL 或密钥' };
+    // 简易超时包装：15 秒没返回就当作网络/防火墙问题
+    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('连接超时（15s），请检查网络或 Supabase URL 是否正确')), 15000));
     try {
       // 用一次轻量请求验证连通性 + 权限（查 customers 表，最多 1 行）
       // 注意：新版 Supabase key（sb_publishable/sb_secret）只能放 apikey header，
       //      不能放 Authorization: Bearer（会被当成 JWT 解析报 Invalid JWT）
-      const r = await fetch(`${SB.url}/rest/v1/customers?select=id&limit=1`, {
+      const fetchP = fetch(`${SB.url}/rest/v1/customers?select=id&limit=1`, {
         headers: { apikey: SB.key, 'Content-Type': 'application/json' }
       });
+      const r = await Promise.race([fetchP, timeout]);
       if (!r.ok) {
         const body = await r.text().catch(() => '');
         let msg = `HTTP ${r.status}`;
         if (r.status === 401 || r.status === 403) msg = '密钥无效或无权限（请确认 anon key 正确）';
         else if (r.status === 404) msg = '表不存在，请先在 Supabase SQL Editor 运行建表 SQL';
+        else if (r.status === 0 || r.status === 502 || r.status === 503) msg = 'Supabase 不可达（' + r.status + '），请检查 URL 或网络';
         else if (body && body.length < 200) msg += ': ' + body;
         SB.lastError = msg; status(msg, 'err');
         return { ok: false, error: msg };
@@ -76,9 +80,10 @@
       return { ok: true };
     } catch (e) {
       SB.connected = false;
-      SB.lastError = e.message || '连接失败';
-      status(SB.lastError, 'err');
-      return { ok: false, error: SB.lastError };
+      const msg = e.message || '连接失败';
+      SB.lastError = msg;
+      status(msg, 'err');
+      return { ok: false, error: msg };
     }
   }
 
