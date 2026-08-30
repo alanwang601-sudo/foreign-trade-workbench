@@ -15,6 +15,16 @@
 
   function getState() { return window.__ftState || {}; }
 
+  function safeSettingsForCloud(settings) {
+    const out = Object.assign({}, settings || {});
+    [
+      'apiKey', 'searchGoogleKey', 'searchBingKey', 'searchBraveKey', 'searchTavilyKey',
+      'webdavPass', 'webdavPassword', 'webdavUser', 'webdavUsername',
+      'sb_key', 'sbKey', 'supabaseKey', 'token', 'accessToken', 'refreshToken'
+    ].forEach(k => { delete out[k]; });
+    return out;
+  }
+
   // =====================================================
   // 一、CloudBase NoSQL 版（window.__ftCloud）
   // =====================================================
@@ -41,8 +51,10 @@
       cbSyncState.connected = true;
       cbSyncState.envId = cfg.envId;
       window.__ftState = window.__ftState || getState();
-      if (eng.fullPush) await eng.fullPush();
+      // 首次连接必须先处理待删 + 拉取远端删除，再上传本地；否则旧设备会把已删除客户重新复活。
+      if (window.__ftFlushDeletes) { try { await window.__ftFlushDeletes(); } catch (e) {} }
       const pull = await eng.pullAndMerge();
+      if (eng.fullPush) await eng.fullPush();
       if (pull && pull.ok && window.__ftRefreshUI) window.__ftRefreshUI();
       if (eng.startPolling) eng.startPolling();
       cbSyncState.lastSync = new Date().toLocaleString('zh-CN');
@@ -70,7 +82,7 @@
     try {
       const st = getState();
       if (!st.settings) return { ok: true };
-      const rec = Object.assign({ updatedAt: new Date().toISOString() }, st.settings);
+      const rec = Object.assign({ updatedAt: new Date().toISOString() }, safeSettingsForCloud(st.settings));
       return await eng.upsertRecord('settings', 'ftw_settings', rec);
     } catch (err) { return { ok: false, error: err.message }; }
   }
@@ -79,6 +91,7 @@
     connect: cbConnect,
     disconnect: cbDisconnect,
     pushAll: () => { const e = cbEngine(); return e && e.fullPush ? e.fullPush() : { ok: false, error: '未加载' }; },
+    clearBusinessData: () => { const e = cbEngine(); return e && e.clearBusinessData ? e.clearBusinessData() : { ok: false, error: '当前 CloudBase 同步层不支持云端整表清空' }; },
     pullAll: () => { const e = cbEngine(); return e && e.pullAndMerge ? e.pullAndMerge() : { ok: false, error: '未加载' }; },
     startPolling: () => { const e = cbEngine(); if (e && e.startPolling) e.startPolling(); },
     pushCalendar: () => pushCalendarVia(cbEngine()),
@@ -118,8 +131,10 @@
       sbSyncState.connected = true;
       sbSyncState.url = cfg.url;
       window.__ftState = window.__ftState || getState();
-      if (eng.fullPush) await eng.fullPush();
+      // 首次连接必须先处理待删 + 拉取远端删除，再上传本地。
+      if (window.__ftFlushDeletes) { try { await window.__ftFlushDeletes(); } catch (e) {} }
       const pull = await eng.pullAndMerge();
+      if (eng.fullPush) await eng.fullPush();
       if (pull && pull.ok && window.__ftRefreshUI) window.__ftRefreshUI();
       if (eng.startPolling) eng.startPolling();
       sbSyncState.lastSync = new Date().toLocaleString('zh-CN');
@@ -136,6 +151,7 @@
     connect: sbConnect,
     disconnect: sbDisconnect,
     pushAll: () => { const e = sbEngine(); return e && e.fullPush ? e.fullPush() : { ok: false, error: '未加载' }; },
+    clearBusinessData: () => { const e = sbEngine(); return e && e.clearBusinessData ? e.clearBusinessData() : { ok: false, error: '未加载' }; },
     pullAll: () => { const e = sbEngine(); return e && e.pullAndMerge ? e.pullAndMerge() : { ok: false, error: '未加载' }; },
     startPolling: () => { const e = sbEngine(); if (e && e.startPolling) e.startPolling(); },
     pushCalendar: () => pushCalendarVia(sbEngine()),

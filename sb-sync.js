@@ -38,8 +38,23 @@
     settings: 'settings'
   };
 
+  // customers 表中的同步控制记录（不会展示到 CRM）。
+  // 单条删除写 tombstone；全量清空写 clear marker，确保其他设备不会把旧客户重新上传。
+  const META_DELETE_PREFIX = '__ft_deleted__:';
+  const META_CLEAR_ID = '__ft_customers_cleared__';
+
   function status(msg, type) { if (SB.onStatus) { try { SB.onStatus(msg, type); } catch (e) {} } }
   function getState() { return window.__ftState || {}; }
+
+  function safeSettingsForCloud(settings) {
+    const out = Object.assign({}, settings || {});
+    [
+      'apiKey', 'searchGoogleKey', 'searchBingKey', 'searchBraveKey', 'searchTavilyKey',
+      'webdavPass', 'webdavPassword', 'webdavUser', 'webdavUsername',
+      'sb_key', 'sbKey', 'supabaseKey', 'token', 'accessToken', 'refreshToken'
+    ].forEach(k => { delete out[k]; });
+    return out;
+  }
 
   // ---------- 保存/读取配置 ----------
   function saveConfig(url, key) {
@@ -149,10 +164,47 @@
         const body = await r.text().catch(() => '');
         return { ok: false, error: `删除失败 HTTP ${r.status}: ${body.slice(0, 150)}` };
       }
+      // 客户删除额外留下云端墓碑。即使这是云端最后一条客户，其他设备也能知道它是“被删了”，
+      // 而不是把自己的旧副本当作新数据重新上传。
+      if (key === 'customers' && !String(id).startsWith('__ft_')) {
+        const deletedAt = new Date().toISOString();
+        const markerId = META_DELETE_PREFIX + id;
+        const mr = await upsertRecord('customers', markerId, { _ftMeta: 'customerDeleted', targetId: id, deletedAt, updatedAt: deletedAt });
+        if (!mr || !mr.ok) return { ok: false, error: (mr && mr.error) || '客户已删除，但云端删除标记写入失败' };
+      }
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e.message || '删除失败' };
     }
+  }
+
+  // ---------- 整表删除 / 业务数据彻底清空 ----------
+  async function deleteAllRecords(key) {
+    if (!SB.connected) return { ok: false, error: '未连接' };
+    const table = TABLES[key];
+    if (!table) return { ok: false, error: '未知表' };
+    try {
+      // id 为主键且非空；not.is.null 会覆盖本表所有记录，包括旧墓碑。
+      const r = await fetch(`${SB.url}/rest/v1/${table}?id=not.is.null`, { method: 'DELETE', headers: hdrs() });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        return { ok: false, error: `清空 ${table} 失败 HTTP ${r.status}: ${body.slice(0, 150)}` };
+      }
+      return { ok: true };
+    } catch (e) { return { ok: false, error: e.message || `清空 ${table} 失败` }; }
+  }
+
+  async function clearBusinessData() {
+    if (!SB.connected) return { ok: false, error: '未连接' };
+    for (const key of ['customers', 'aiHistory', 'marketAnalyses']) {
+      const r = await deleteAllRecords(key);
+      if (!r.ok) return r;
+    }
+    // 全量清空标记：保留一条控制记录，防止其他设备把“云端为空”误判成异常后重新上传旧客户。
+    const clearedAt = new Date().toISOString();
+    const m = await upsertRecord('customers', META_CLEAR_ID, { _ftMeta: 'customersCleared', clearedAt, updatedAt: clearedAt });
+    if (!m.ok) return m;
+    return { ok: true, clearedAt };
   }
 
   // ---------- 全量推送 ----------
@@ -179,7 +231,7 @@
         await upsertRecord('calendar', 'ftw_calendar', calRec);
       }
       if (st.settings) {
-        const setRec = Object.assign({ updatedAt: new Date().toISOString() }, st.settings);
+        const setRec = Object.assign({ updatedAt: new Date().toISOString() }, safeSettingsForCloud(st.settings));
         await upsertRecord('settings', 'ftw_settings', setRec);
       }
       SB.lastSync = new Date().toLocaleString('zh-CN');
@@ -202,7 +254,29 @@
         if (res.ok && Array.isArray(res.records)) {
           if (key === 'customers') {
             const tombs = st.tombstones || {};
-            // 墓碑判定：本地已删掉的客户，云端旧记录不许复活
+            const allRemote = res.records || [];
+            const clearMarker = allRemote.find(c => c && c.id === META_CLEAR_ID && c._ftMeta === 'customersCleared');
+            const deleteMarkers = allRemote.filter(c => c && String(c.id || '').startsWith(META_DELETE_PREFIX) && c._ftMeta === 'customerDeleted');
+            const remoteCustomers = allRemote.filter(c => c && !String(c.id || '').startsWith('__ft_'));
+
+            // 先应用云端删除控制记录，再做普通合并。
+            deleteMarkers.forEach(m => {
+              if (m.targetId) tombs[m.targetId] = m.deletedAt || m.updatedAt || new Date().toISOString();
+            });
+            if (clearMarker) {
+              const ct = new Date(clearMarker.clearedAt || clearMarker.updatedAt || 0).getTime();
+              if (ct) {
+                (st.customers || []).forEach(c => {
+                  if (!c || !c.id) return;
+                  // 全量清空是显式的全局操作：凡是在清空时间之前存在的本地客户都应删除，
+                  // 不依赖旧版本是否带 syncedAt。只有清空之后真正新建/修改的记录才保留。
+                  const t = new Date(c.updatedAt || c.createdAt || c.syncedAt || 0).getTime();
+                  if (!t || t <= ct + 1000) tombs[c.id] = clearMarker.clearedAt || clearMarker.updatedAt;
+                });
+              }
+            }
+
+            // 墓碑判定：本地/云端已删掉的客户，旧记录不许复活
             const isDead = (id, updatedAt) => {
               if (!id || !tombs[id]) return false;
               const t = new Date(tombs[id] || 0).getTime();
@@ -210,23 +284,24 @@
               if (!updatedAt) return true;
               return t >= new Date(updatedAt).getTime() - 1000;
             };
-            // 跟随云端删除：本地曾成功同步过（有 syncedAt）、但云端已无此记录 → 说明别的设备删了
-            // 保护：云端整表为空时不判定（避免云端被清空导致本地全删），且单次跟随删除上限 20 条
-            const cloudIds = new Set(res.records.map(c => c.id).filter(Boolean));
-            if (cloudIds.size > 0 && res.records.length > 0) {
+
+            // 兼容旧版本没有云端 tombstone 的删除：云端存在其他真实客户时，缺失的已同步客户视为远端删除。
+            const cloudIds = new Set(remoteCustomers.map(c => c.id).filter(Boolean));
+            if (remoteCustomers.length > 0) {
               const nowIso = new Date().toISOString();
               const gone = (st.customers || []).filter(c => c.id && !cloudIds.has(c.id) && c.syncedAt && !tombs[c.id]);
-              if (gone.length && gone.length <= 20) {
+              if (gone.length && gone.length <= 100) {
                 gone.forEach(c => { tombs[c.id] = nowIso; });
                 if (typeof window.__ftOnRemoteDelete === 'function') {
                   try { window.__ftOnRemoteDelete(gone.map(c => c.name || c.id)); } catch (e) {}
                 }
               }
             }
+
             const localMap = new Map((st.customers || []).map(c => [c.id, c]));
-            res.records.forEach(c => {
+            remoteCustomers.forEach(c => {
               if (!c.id) return;
-              if (isDead(c.id, c.updatedAt)) return;      // ★ 已删除，不采纳云端记录
+              if (isDead(c.id, c.updatedAt)) return;
               if (localMap.has(c.id)) {
                 const t1 = new Date(localMap.get(c.id).updatedAt || 0).getTime();
                 const t2 = new Date(c.updatedAt || 0).getTime();
@@ -326,7 +401,7 @@
       if (!SB.connected) return;
       if (isBusy()) return;
       // 补推离线期间删掉的客户（断网时删除没能通知云端，联网后在这里补删）
-      if (window.__ftFlushDeletes) { try { window.__ftFlushDeletes(); } catch (e) {} }
+      if (window.__ftFlushDeletes) { try { await window.__ftFlushDeletes(); } catch (e) {} }
       const cur = fingerprint();
       if (cur !== SB.lastFingerprint) { SB.lastFingerprint = cur; try { await fullPush(); } catch (e) {} }
       const r = await pullAndMerge();
@@ -342,7 +417,7 @@
 
   window.__ftSupabase = {
     connect, disconnect, fullPush, pullAndMerge, startPolling, stopPolling,
-    pullTable, upsertRecord, deleteRecord,
+    pullTable, upsertRecord, deleteRecord, deleteAllRecords, clearBusinessData,
     saveConfig, getConfig,
     getState: () => ({ connected: SB.connected, lastSync: SB.lastSync, lastError: SB.lastError }),
     onStatus: (fn) => { SB.onStatus = fn; },

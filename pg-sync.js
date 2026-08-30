@@ -42,7 +42,20 @@
     settings: 'settings'
   };
 
+  const META_DELETE_PREFIX = '__ft_deleted__:';
+  const META_CLEAR_ID = '__ft_customers_cleared__';
+
   function status(msg, type) { if (PG.onStatus) { try { PG.onStatus(msg, type); } catch (e) {} } }
+
+  function safeSettingsForCloud(settings) {
+    const out = Object.assign({}, settings || {});
+    [
+      'apiKey', 'searchGoogleKey', 'searchBingKey', 'searchBraveKey', 'searchTavilyKey',
+      'webdavPass', 'webdavPassword', 'webdavUser', 'webdavUsername',
+      'sb_key', 'sbKey', 'supabaseKey', 'token', 'accessToken', 'refreshToken'
+    ].forEach(k => { delete out[k]; });
+    return out;
+  }
 
   // ---------- 自动创建所有需要的集合（连接后兜底，避免用户手动建集合） ----------
   async function ensureCollections() {
@@ -139,13 +152,46 @@
   // ---------- 删除记录 ----------
   async function deleteRecord(key, id) {
     const coll = getColl(key);
-    if (!coll) return;
+    if (!coll) return { ok: false, error: '未连接' };
     try {
       const existing = await coll.where({ bizId: id }).limit(1).get();
       if (existing.data && existing.data.length > 0) {
         await coll.doc(existing.data[0]._id).remove();
       }
-    } catch (e) {}
+      if (key === 'customers' && !String(id).startsWith('__ft_')) {
+        const deletedAt = new Date().toISOString();
+        const mr = await upsertRecord('customers', META_DELETE_PREFIX + id, { _ftMeta: 'customerDeleted', targetId: id, deletedAt, updatedAt: deletedAt });
+        if (!mr || !mr.ok) return { ok: false, error: (mr && mr.error) || '删除标记写入失败' };
+      }
+      return { ok: true };
+    } catch (e) { return { ok: false, error: e.message || '删除失败' }; }
+  }
+
+  async function deleteAllRecords(key) {
+    const coll = getColl(key);
+    if (!coll) return { ok: false, error: '未连接' };
+    try {
+      // Web SDK 单次查询有上限，循环取一批删一批。
+      while (true) {
+        const res = await coll.limit(100).get();
+        const rows = res.data || [];
+        if (!rows.length) break;
+        for (const row of rows) { if (row && row._id) await coll.doc(row._id).remove(); }
+        if (rows.length < 100) break;
+      }
+      return { ok: true };
+    } catch (e) { return { ok: false, error: e.message || '清空失败' }; }
+  }
+
+  async function clearBusinessData() {
+    for (const key of ['customers', 'aiHistory', 'marketAnalyses']) {
+      const r = await deleteAllRecords(key);
+      if (!r.ok) return r;
+    }
+    const clearedAt = new Date().toISOString();
+    const m = await upsertRecord('customers', META_CLEAR_ID, { _ftMeta: 'customersCleared', clearedAt, updatedAt: clearedAt });
+    if (!m.ok) return m;
+    return { ok: true, clearedAt };
   }
 
   // ---------- 全量推送本地数据到云端 ----------
@@ -168,7 +214,7 @@
       }
       // 配置数据作为单条记录整体同步（公司画像 + API Key + 连接配置）
       if (st.settings) {
-        const setRec = Object.assign({ updatedAt: new Date().toISOString() }, st.settings);
+        const setRec = Object.assign({ updatedAt: new Date().toISOString() }, safeSettingsForCloud(st.settings));
         await upsertRecord('settings', 'ftw_settings', setRec);
       }
       PG.lastSync = new Date().toLocaleString('zh-CN');
@@ -192,7 +238,22 @@
         if (res.ok && Array.isArray(res.records)) {
           if (key === 'customers') {
             const tombs = st.tombstones || {};
-            // 墓碑判定：本地已删掉的客户，云端旧记录不许复活
+            const allRemote = res.records || [];
+            const clearMarker = allRemote.find(c => c && c.id === META_CLEAR_ID && c._ftMeta === 'customersCleared');
+            const deleteMarkers = allRemote.filter(c => c && String(c.id || '').startsWith(META_DELETE_PREFIX) && c._ftMeta === 'customerDeleted');
+            const remoteCustomers = allRemote.filter(c => c && !String(c.id || '').startsWith('__ft_'));
+
+            deleteMarkers.forEach(m => { if (m.targetId) tombs[m.targetId] = m.deletedAt || m.updatedAt || new Date().toISOString(); });
+            if (clearMarker) {
+              const ct = new Date(clearMarker.clearedAt || clearMarker.updatedAt || 0).getTime();
+              if (ct) {
+                (st.customers || []).forEach(c => {
+                  if (!c || !c.id) return;
+                  const t = new Date(c.updatedAt || c.createdAt || c.syncedAt || 0).getTime();
+                  if (!t || t <= ct + 1000) tombs[c.id] = clearMarker.clearedAt || clearMarker.updatedAt;
+                });
+              }
+            }
             const isDead = (id, updatedAt) => {
               if (!id || !tombs[id]) return false;
               const t = new Date(tombs[id] || 0).getTime();
@@ -201,16 +262,14 @@
               return t >= new Date(updatedAt).getTime() - 1000;
             };
             const localMap = new Map((st.customers || []).map(c => [c.id, c]));
-            res.records.forEach(c => {
+            remoteCustomers.forEach(c => {
               if (!c.id) return;
-              if (isDead(c.id, c.updatedAt)) return;      // ★ 已删除，不采纳云端记录
+              if (isDead(c.id, c.updatedAt)) return;
               if (localMap.has(c.id)) {
                 const t1 = new Date(localMap.get(c.id).updatedAt || 0).getTime();
                 const t2 = new Date(c.updatedAt || 0).getTime();
                 localMap.set(c.id, t2 >= t1 ? c : localMap.get(c.id));
-              } else {
-                localMap.set(c.id, c);
-              }
+              } else localMap.set(c.id, c);
             });
             st.customers = Array.from(localMap.values()).filter(c => !isDead(c.id, c.updatedAt));
           } else {
@@ -283,6 +342,7 @@
     PG.pollTimer = setInterval(async () => {
       if (!PG.connected) return;
       if (isBusy()) return;
+      if (window.__ftFlushDeletes) { try { await window.__ftFlushDeletes(); } catch (e) {} }
       const cur = fingerprint();
       if (cur !== PG.lastFingerprint) {
         PG.lastFingerprint = cur;
@@ -303,7 +363,7 @@
 
   window.__ftPg = {
     connect, disconnect, fullPush, pullAndMerge, startPolling, stopPolling,
-    pullTable, upsertRecord, deleteRecord,
+    pullTable, upsertRecord, deleteRecord, deleteAllRecords, clearBusinessData,
     getState: () => ({ connected: PG.connected, envId: PG.envId, lastSync: PG.lastSync, lastError: PG.lastError }),
     onStatus: (fn) => { PG.onStatus = fn; },
     onSettings: (fn) => { PG.onSettings = fn; }
