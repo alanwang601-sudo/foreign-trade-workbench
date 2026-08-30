@@ -271,6 +271,15 @@ input:focus, select:focus, textarea:focus { border-color: var(--primary); }
 .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
 .row4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px; }
 
+/* 联系人块（含角色/优先级/可信度/LinkedIn） */
+.contact-block { border: 1px solid var(--border); border-radius: 10px; padding: 10px; margin-bottom: 10px; background: var(--panel-2, rgba(127,127,127,.04)); display: flex; flex-direction: column; gap: 8px; }
+.contact-block .row2, .contact-block .row3 { gap: 8px; }
+.contact-block select, .contact-block input { width: 100%; }
+.contact-block .contact-del { width: 100%; }
+.contact-detail { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; background: var(--panel-2, rgba(127,127,127,.04)); }
+.contact-detail-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.b-rating { background: #f59e0b; color: #fff; border-radius: 999px; padding: 0 7px; font-size: 11px; font-weight: 700; }
+
 /* modal */
 .modal-mask { position: fixed; inset: 0; background: rgba(15,23,42,.5); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }
 .modal {
