@@ -139,12 +139,20 @@
 
   // ---------- 删除记录 ----------
   async function deleteRecord(key, id) {
-    if (!SB.connected) return;
+    if (!SB.connected) return { ok: false, error: '未连接' };
     const table = TABLES[key];
-    if (!table) return;
+    if (!table) return { ok: false, error: '未知表' };
+    if (!id) return { ok: false, error: '缺少 id' };
     try {
-      await fetch(`${SB.url}/rest/v1/${table}?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', headers: hdrs() });
-    } catch (e) {}
+      const r = await fetch(`${SB.url}/rest/v1/${table}?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', headers: hdrs() });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        return { ok: false, error: `删除失败 HTTP ${r.status}: ${body.slice(0, 150)}` };
+      }
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e.message || '删除失败' };
+    }
   }
 
   // ---------- 全量推送 ----------
@@ -157,7 +165,13 @@
         const list = st[key] || [];
         for (const rec of list) {
           const id = rec.id || rec.bizId;
-          if (id) await upsertRecord(key, id, rec);
+          if (!id) continue;
+          // syncedAt = "这条已成功同步到云端"的标记，必须随数据一起推上去，
+          // 否则 pull 回来时本地对象被云端记录替换、这个标记就丢了，
+          // 后面就无法区分「新建还没推」和「别处已删除」两种情况。
+          if (key === 'customers') rec.syncedAt = new Date().toISOString();
+          const r = await upsertRecord(key, id, rec);
+          if (r && !r.ok && key === 'customers') delete rec.syncedAt;  // 推送失败就不算同步过
         }
       }
       if (st.calendar) {
@@ -187,16 +201,39 @@
         const res = await pullTable(key);
         if (res.ok && Array.isArray(res.records)) {
           if (key === 'customers') {
+            const tombs = st.tombstones || {};
+            // 墓碑判定：本地已删掉的客户，云端旧记录不许复活
+            const isDead = (id, updatedAt) => {
+              if (!id || !tombs[id]) return false;
+              const t = new Date(tombs[id] || 0).getTime();
+              if (!t) return false;
+              if (!updatedAt) return true;
+              return t >= new Date(updatedAt).getTime() - 1000;
+            };
+            // 跟随云端删除：本地曾成功同步过（有 syncedAt）、但云端已无此记录 → 说明别的设备删了
+            // 保护：云端整表为空时不判定（避免云端被清空导致本地全删），且单次跟随删除上限 20 条
+            const cloudIds = new Set(res.records.map(c => c.id).filter(Boolean));
+            if (cloudIds.size > 0 && res.records.length > 0) {
+              const nowIso = new Date().toISOString();
+              const gone = (st.customers || []).filter(c => c.id && !cloudIds.has(c.id) && c.syncedAt && !tombs[c.id]);
+              if (gone.length && gone.length <= 20) {
+                gone.forEach(c => { tombs[c.id] = nowIso; });
+                if (typeof window.__ftOnRemoteDelete === 'function') {
+                  try { window.__ftOnRemoteDelete(gone.map(c => c.name || c.id)); } catch (e) {}
+                }
+              }
+            }
             const localMap = new Map((st.customers || []).map(c => [c.id, c]));
             res.records.forEach(c => {
               if (!c.id) return;
+              if (isDead(c.id, c.updatedAt)) return;      // ★ 已删除，不采纳云端记录
               if (localMap.has(c.id)) {
                 const t1 = new Date(localMap.get(c.id).updatedAt || 0).getTime();
                 const t2 = new Date(c.updatedAt || 0).getTime();
                 localMap.set(c.id, t2 >= t1 ? c : localMap.get(c.id));
               } else localMap.set(c.id, c);
             });
-            st.customers = Array.from(localMap.values());
+            st.customers = Array.from(localMap.values()).filter(c => !isDead(c.id, c.updatedAt));
           } else {
             st[key] = res.records;
           }
@@ -288,6 +325,8 @@
     SB.pollTimer = setInterval(async () => {
       if (!SB.connected) return;
       if (isBusy()) return;
+      // 补推离线期间删掉的客户（断网时删除没能通知云端，联网后在这里补删）
+      if (window.__ftFlushDeletes) { try { window.__ftFlushDeletes(); } catch (e) {} }
       const cur = fingerprint();
       if (cur !== SB.lastFingerprint) { SB.lastFingerprint = cur; try { await fullPush(); } catch (e) {} }
       const r = await pullAndMerge();

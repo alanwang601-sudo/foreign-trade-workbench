@@ -10,8 +10,14 @@ const LS = {
   customers: 'ftw_customers',
   aiHistory: 'ftw_ai_history',
   marketAnalyses: 'ftw_market_analyses',
-  calendar: 'ftw_calendar' // { todos: [], customHolidays: [] }
+  calendar: 'ftw_calendar', // { todos: [], customHolidays: [] }
+  tombstones: 'ftw_tombstones', // 删除墓碑：{ 客户id: 删除时间ISO }，防止云端旧数据把删掉的客户拉回来
+  trash: 'ftw_trash'            // 回收站：{ 客户id: { deletedAt, snapshot } }，30 天内可恢复
 };
+// 墓碑 / 回收站保留时长（毫秒）：30 天后自动清除，避免无限增长
+const TOMBSTONE_TTL = 30 * 24 * 3600 * 1000;
+// 回收站最多保留条数（防止 localStorage 被撑爆）
+const TRASH_MAX = 50;
 // 开发阶段：主流程 9 阶段 + 3 个特殊状态
 const STAGES = ['线索', '已验证', '已建联', '已回复', '需求确认', '已报价', '样品测试', '商务谈判', '成交', '暂缓', '无回复', '不匹配'];
 const STAGE_CLASS = { '线索': 'b-lead', '已验证': 'b-lead', '已建联': 'b-opp', '已回复': 'b-opp', '需求确认': 'b-opp', '已报价': 'b-nego', '样品测试': 'b-nego', '商务谈判': 'b-nego', '成交': 'b-won', '暂缓': 'b-lost', '无回复': 'b-lead', '不匹配': 'b-lost' };
@@ -104,6 +110,9 @@ const state = {
   crmCountry: '',
   crmIndustry: '',
   crmFollowUp: 'all', // 'all' | 'due'
+  tombstones: {},     // 删除墓碑：{ 客户id: 删除时间 }，挡住云端旧记录复活
+  trash: {},          // 回收站：{ 客户id: { deletedAt, snapshot } }，30 天内可一键恢复
+  pendingDeletes: [], // 离线期间删除、联网后待补推到云端的客户 id
   crmGrade: '全部',   // 客户评级筛选：'全部' | 'A+' | 'A' | 'B' | 'C' | '未评级'
   crmNoFollowDays: 0, // 「≥N 天没跟进」筛选，0 = 不限（配合评级用：A+ 且 7 天没跟进）
   crmSel: new Set(),
@@ -126,7 +135,168 @@ function persistAll() {
   saveLS(LS.aiHistory, state.aiHistory);
   saveLS(LS.marketAnalyses, state.marketAnalyses);
   saveLS(LS.calendar, state.calendar);
+  if (state.tombstones && Object.keys(state.tombstones).length) saveLS(LS.tombstones, state.tombstones);
+  else { try { localStorage.removeItem(LS.tombstones); } catch (e) {} }
+  if (state.trash && Object.keys(state.trash).length) saveLS(LS.trash, state.trash);
+  else { try { localStorage.removeItem(LS.trash); } catch (e) {} }
 }
+
+// =========================================================
+// 删除墓碑：本地删掉的客户，必须挡住云端旧记录被拉回来
+// =========================================================
+// 墓碑里是否有这个客户（且墓碑不早于该记录的更新时间）
+function isTombstoned(id, updatedAt) {
+  if (!id || !state.tombstones || !state.tombstones[id]) return false;
+  const t = new Date(state.tombstones[id] || 0).getTime();
+  if (!t) return false;
+  if (!updatedAt) return true;
+  return t >= new Date(updatedAt).getTime() - 1000; // 1 秒容差，避免时钟误差
+}
+// 清理过期墓碑与回收站（超过 TOMBSTONE_TTL 的删除记录不再需要拦截 / 不再可恢复）
+function pruneTombstones() {
+  const now = Date.now();
+  let n = 0;
+  Object.keys(state.tombstones || {}).forEach(id => {
+    const t = new Date(state.tombstones[id] || 0).getTime();
+    if (!t || now - t > TOMBSTONE_TTL) { delete state.tombstones[id]; n++; }
+  });
+  Object.keys(state.trash || {}).forEach(id => {
+    const t = new Date((state.trash[id] || {}).deletedAt || 0).getTime();
+    if (!t || now - t > TOMBSTONE_TTL) { delete state.trash[id]; n++; }
+  });
+  return n;
+}
+// 回收站超出上限时，丢掉最旧的几条
+function trimTrash() {
+  const ids = Object.keys(state.trash || {});
+  if (ids.length <= TRASH_MAX) return 0;
+  const sorted = ids.slice().sort((a, b) =>
+    new Date((state.trash[a] || {}).deletedAt || 0) - new Date((state.trash[b] || {}).deletedAt || 0));
+  let n = 0;
+  while (Object.keys(state.trash).length > TRASH_MAX) { delete state.trash[sorted[n]]; n++; }
+  return n;
+}
+// 从回收站恢复客户（同时撤掉墓碑，客户会重新同步到云端）
+function restoreCustomer(id) {
+  const item = (state.trash || {})[id];
+  if (!item || !item.snapshot) return false;
+  const c = Object.assign({}, item.snapshot, { updatedAt: nowISO() });
+  delete c.syncedAt;   // 让下次推送重新上传
+  if (!state.customers.some(x => x.id === id)) state.customers.push(c);
+  delete state.trash[id];
+  delete state.tombstones[id];
+  persistAll();
+  return true;
+}
+// 彻底清除（从回收站抹掉，墓碑保留到过期，确保云端不会把它拉回来）
+function purgeFromTrash(id) {
+  if (state.trash && state.trash[id]) delete state.trash[id];
+  persistAll();
+}
+// 找出当前真正连上的底层同步引擎（Supabase / CloudBase NoSQL）
+// 注意：包装层 __ftCloud / __ftSupabaseCloud 没有 deleteRecord，必须用底层引擎
+function liveSyncEngines() {
+  const out = [];
+  [window.__ftSupabase, window.__ftPg].forEach(e => {
+    if (!e || typeof e.deleteRecord !== 'function') return;
+    try {
+      const s = (typeof e.getState === 'function') ? (e.getState() || {}) : {};
+      if (s.connected === true) out.push(e);
+    } catch (err) { /* 状态读取失败就当没连上 */ }
+  });
+  return out;
+}
+// 统一的客户删除入口：本地删除 + 记墓碑 + 通知所有已连接的云端引擎真删
+function deleteCustomers(ids) {
+  const idArr = Array.from(ids || []).filter(Boolean);
+  if (!idArr.length) return { n: 0, pending: 0, synced: false };
+  const stamp = nowISO();
+  // 先留快照进回收站（30 天内可恢复），再记墓碑
+  idArr.forEach(id => {
+    const c = state.customers.find(x => x.id === id);
+    if (c) state.trash[id] = { deletedAt: stamp, snapshot: JSON.parse(JSON.stringify(c)) };
+    state.tombstones[id] = stamp;
+  });
+  trimTrash();
+  const before = state.customers.length;
+  state.customers = state.customers.filter(c => !state.tombstones[c.id]);
+  const removed = before - state.customers.length;
+  // 通知云端：已连接就直接删，没连接就排队等下次联网补删
+  const engines = liveSyncEngines();
+  engines.forEach(e => { idArr.forEach(id => { try { e.deleteRecord('customers', id); } catch (err) {} }); });
+  if (!engines.length) idArr.forEach(id => { if (!state.pendingDeletes.includes(id)) state.pendingDeletes.push(id); });
+  persistAll();
+  return { n: removed, pending: state.pendingDeletes.length, synced: engines.length > 0 };
+}
+// 补推离线期间的删除（联网后 / 每次轮询时会调用）
+function flushPendingDeletes() {
+  if (!state.pendingDeletes || !state.pendingDeletes.length) return 0;
+  const engines = liveSyncEngines();
+  if (!engines.length) return 0;
+  const ids = state.pendingDeletes.slice();
+  state.pendingDeletes = [];
+  engines.forEach(e => { ids.forEach(id => { try { e.deleteRecord('customers', id); } catch (err) {} }); });
+  persistAll();
+  return ids.length;
+}
+window.__ftFlushDeletes = flushPendingDeletes;
+// 回收站：30 天内删掉的客户可一键恢复
+function openTrash() {
+  const items = Object.keys(state.trash || {})
+    .map(id => Object.assign({ id }, state.trash[id]))
+    .sort((a, b) => new Date(b.deletedAt || 0) - new Date(a.deletedAt || 0));
+  if (!items.length) {
+    showModal(`<div class="empty"><div class="big">🗑</div>回收站是空的<div class="small muted mt8">删除客户会在这里保留 30 天</div></div>`,
+      { title: '回收站', foot: false });
+    return;
+  }
+  const rows = items.map(it => {
+    const s = it.snapshot || {};
+    const d = new Date(it.deletedAt || 0);
+    const days = Math.floor((Date.now() - d.getTime()) / 86400000);
+    return `<div class="contact-detail">
+      <div class="contact-detail-head">
+        <strong>${esc(s.name || '(无名)')}</strong>
+        ${s.stage ? `<span class="badge ${STAGE_CLASS[s.stage] || 'b-tag'}">${esc(s.stage)}</span>` : ''}
+        ${custGrade(s) ? `<span class="badge b-rating ${ratingBadgeClass(custGrade(s))}">⭐${esc(custGrade(s))}</span>` : ''}
+        <span class="small muted" style="margin-left:auto">${days <= 0 ? '今天' : days + ' 天前'}删除</span>
+      </div>
+      <div class="small muted">${esc(s.country || '')}${s.industry ? ' · ' + esc(s.industry) : ''}${(s.contacts || []).length ? ' · ' + s.contacts.length + ' 个联系人' : ''}</div>
+      <div class="flex gap8 mt8">
+        <button class="btn sm primary" data-restore="${esc(it.id)}">↩ 恢复</button>
+        <button class="btn sm danger" data-purge="${esc(it.id)}">彻底删除</button>
+      </div>
+    </div>`;
+  }).join('');
+  showModal(`
+    <div class="small muted mb12">共 ${items.length} 个已删除客户，保留 30 天。恢复后会重新同步到云端。</div>
+    <div id="trash-list">${rows}</div>
+  `, { title: '🗑 回收站', foot: true, wide: true });
+  const foot = $('#modal-foot');
+  foot.innerHTML = `<button class="btn ghost" data-close>关闭</button><button class="btn danger" id="trash-empty">清空回收站</button>`;
+  $all('[data-close]', foot).forEach(b => b.addEventListener('click', closeModal));
+  const bind = () => {
+    $all('#trash-list [data-restore]').forEach(b => b.addEventListener('click', () => {
+      const id = b.dataset.restore;
+      if (restoreCustomer(id)) { toast('已恢复', (state.customers.find(c => c.id === id) || {}).name || '', 'ok'); closeModal(); renderCrm(); openTrash(); }
+    }));
+    $all('#trash-list [data-purge]').forEach(b => b.addEventListener('click', () => {
+      purgeFromTrash(b.dataset.purge); closeModal(); openTrash();
+    }));
+  };
+  bind();
+  foot.querySelector('#trash-empty').addEventListener('click', () => {
+    if (!confirm(`清空回收站？${items.length} 个已删除客户将无法恢复。`)) return;
+    state.trash = {}; persistAll(); closeModal(); openTrash(); toast('回收站已清空', '', 'ok');
+  });
+}
+
+// 别的设备删掉了客户 → 本机同步移除时给个提示，避免"客户自己消失了"的困惑
+window.__ftOnRemoteDelete = function (names) {
+  const list = (names || []).filter(Boolean);
+  if (!list.length) return;
+  toast('已同步其他设备的删除', `${list.slice(0, 3).join('、')}${list.length > 3 ? ` 等 ${list.length} 个` : ''}客户已在其他设备删除，本机已同步移除`, 'warn');
+};
 
 // ---------- 工具 ----------
 function uid() { return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
@@ -1792,6 +1962,7 @@ function renderMarket() {
 function getFilteredCustomers() {
   const q = state.crmSearch.trim().toLowerCase();
   return state.customers.filter(c => {
+    if (state.tombstones && state.tombstones[c.id]) return false; // 已删除的客户不再出现
     if (state.crmStage !== '全部' && c.stage !== state.crmStage) return false;
     if (state.crmCountry && (c.country || '') !== state.crmCountry) return false;
     if (state.crmIndustry && (c.industry || '') !== state.crmIndustry) return false;
@@ -1923,12 +2094,14 @@ function bindBatchBar() {
   bar.querySelector('[data-batch="del"]').addEventListener('click', () => {
     const sel = selectedCustomers();
     if (!sel.length) return;
-    if (!confirm(`确定批量删除选中的 ${sel.length} 个客户？此操作不可撤销。`)) return;
+    if (!confirm(`确定批量删除选中的 ${sel.length} 个客户？\n删除后会同步到云端，其他设备登录同一账号时也会消失。此操作不可撤销。`)) return;
     const ids = new Set(state.crmSel);
-    state.customers = state.customers.filter(c => !ids.has(c.id));
+    const r = deleteCustomers(ids);
     state.crmSel.clear();
-    persistAll(); renderCrmTable(); updateBatchBar();
-    toast('已删除', `${sel.length} 个客户`, 'ok');
+    renderCrmTable(); updateBatchBar();
+    toast('已删除 ' + r.n + ' 个客户',
+      r.synced ? '已从云端同步删除' : (r.pending ? `离线中，${r.pending} 条待联网后同步删除` : ''),
+      'ok');
   });
   bar.querySelector('[data-batch="stage"]').addEventListener('click', () => {
     const st = $('#crm-batch-stage').value;
@@ -2639,9 +2812,10 @@ function openCustomerDetail(id) {
     toast(c.cooperating ? '已标记为合作客户' : '已取消合作标记', c.name, 'ok');
   });
   $('#d-del').addEventListener('click', () => {
-    if (!confirm(`确定删除客户「${c.name}」？此操作不可撤销。`)) return;
-    state.customers = state.customers.filter(x => x.id !== c.id);
-    persistAll(); closeModal(); renderCrm(); toast('已删除', c.name, 'ok');
+    if (!confirm(`确定删除客户「${c.name}」？\n删除后会同步到云端，其他设备登录同一账号时也会消失。此操作不可撤销。`)) return;
+    const r = deleteCustomers([c.id]);
+    closeModal(); renderCrm();
+    toast('已删除 ' + c.name, r.synced ? '已从云端同步删除' : (r.pending ? '离线中，待联网后同步删除' : ''), 'ok');
   });
 }
 
@@ -3333,8 +3507,10 @@ function renderSettings() {
         <div class="flex gap8 wrap">
           <button class="btn" id="st-export">导出 JSON</button>
           <button class="btn" id="st-import">导入 JSON</button>
+          <button class="btn" id="st-trash">🗑 回收站（${Object.keys(state.trash || {}).length}）</button>
           <button class="btn danger" id="st-clear">清空全部</button>
         </div>
+        <div class="help" style="margin-top:6px">删除的客户会在回收站保留 30 天，期间可一键恢复（恢复后会重新同步到云端）。</div>
       </div>
       <div class="divider"></div>
       <div class="field"><label>外观</label>
@@ -3549,6 +3725,8 @@ function renderSettings() {
     persistAll(); toast('导入完成', `${state.customers.length} 个客户`, 'ok'); render();
   });
 
+  const trashBtn = $('#st-trash');
+  if (trashBtn) trashBtn.addEventListener('click', () => openTrash());
   $('#st-clear').addEventListener('click', () => {
     if (!confirm('将清空全部客户、市场分析与 AI 记录，且无法恢复，确定？')) return;
     state.customers = []; state.aiHistory = []; state.marketAnalyses = [];
@@ -3791,6 +3969,15 @@ async function init() {
   state.aiHistory = loadLS(LS.aiHistory, []);
   state.marketAnalyses = loadLS(LS.marketAnalyses, []);
   state.calendar = Object.assign({ todos: [], customHolidays: [] }, loadLS(LS.calendar, { todos: [], customHolidays: [] }));
+  // 删除墓碑 + 回收站：上次删掉的客户，防止云端同步把它们拉回来，并留出恢复机会
+  state.tombstones = loadLS(LS.tombstones, {}) || {};
+  state.trash = loadLS(LS.trash, {}) || {};
+  state.pendingDeletes = [];
+  const pruned = pruneTombstones();
+  // 墓碑里的客户一律不出现在列表里（含本轮刚清理前遗留的）
+  const tombIds = Object.keys(state.tombstones);
+  if (tombIds.length) state.customers = state.customers.filter(c => !state.tombstones[c.id]);
+  if (pruned) saveLS(LS.tombstones, state.tombstones);
 
   // 暴露给 CloudBase 实时同步模块
   window.__ftState = state;

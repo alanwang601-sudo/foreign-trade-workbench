@@ -191,9 +191,19 @@
         const res = await pullTable(key);
         if (res.ok && Array.isArray(res.records)) {
           if (key === 'customers') {
+            const tombs = st.tombstones || {};
+            // 墓碑判定：本地已删掉的客户，云端旧记录不许复活
+            const isDead = (id, updatedAt) => {
+              if (!id || !tombs[id]) return false;
+              const t = new Date(tombs[id] || 0).getTime();
+              if (!t) return false;
+              if (!updatedAt) return true;
+              return t >= new Date(updatedAt).getTime() - 1000;
+            };
             const localMap = new Map((st.customers || []).map(c => [c.id, c]));
             res.records.forEach(c => {
               if (!c.id) return;
+              if (isDead(c.id, c.updatedAt)) return;      // ★ 已删除，不采纳云端记录
               if (localMap.has(c.id)) {
                 const t1 = new Date(localMap.get(c.id).updatedAt || 0).getTime();
                 const t2 = new Date(c.updatedAt || 0).getTime();
@@ -202,7 +212,7 @@
                 localMap.set(c.id, c);
               }
             });
-            st.customers = Array.from(localMap.values());
+            st.customers = Array.from(localMap.values()).filter(c => !isDead(c.id, c.updatedAt));
           } else {
             st[key] = res.records;
           }
