@@ -24,6 +24,9 @@ const CONTACT_CREDIBILITY = ['已验证', '高可信', '推测', '未验证'];
 const PRIO_LABEL = { 'P1': 'P1 首要联系人', 'P2': 'P2 第二联系人', 'P3': 'P3 升级联系人' };
 const PRIO_CLASS = { 'P1': 'b-due', 'P2': 'b-opp', 'P3': 'b-tag' };
 const CRED_CLASS = { '已验证': 'b-won', '高可信': 'b-opp', '推测': 'b-tag', '未验证': 'b-lost' };
+// 产品匹配类型
+const MATCH_TYPES = ['直接交叉', '同型号替代', '功能替代', '潜在匹配', '待确认'];
+const MATCH_CLASS = { '直接交叉': 'b-won', '同型号替代': 'b-won', '功能替代': 'b-opp', '潜在匹配': 'b-tag', '待确认': 'b-lost' };
 const CHART_COLORS = ['#4f46e5', '#0891b2', '#16a34a', '#d97706', '#dc2626', '#7c3aed', '#db2777', '#0ea5e9'];
 const DEFAULT_SETTINGS = { provider: 'deepseek', apiBase: 'https://api.deepseek.com/v1', apiKey: '', model: 'deepseek-chat', temperature: 0.7, theme: 'light',
   searchEngine: 'tavily', searchGoogleKey: '', searchGoogleCx: '', searchBingKey: '', searchBraveKey: '', searchTavilyKey: '',
@@ -101,6 +104,8 @@ const state = {
   crmCountry: '',
   crmIndustry: '',
   crmFollowUp: 'all', // 'all' | 'due'
+  crmGrade: '全部',   // 客户评级筛选：'全部' | 'A+' | 'A' | 'B' | 'C' | '未评级'
+  crmNoFollowDays: 0, // 「≥N 天没跟进」筛选，0 = 不限（配合评级用：A+ 且 7 天没跟进）
   crmSel: new Set(),
   seenSearchLinks: new Set(), // 本轮"智能开发"已看过的网页链接，再次搜索时排除，找新网页
   // 智能开发表单：切换视图时保留已填写内容
@@ -152,14 +157,27 @@ function ratingDays(rating) {
   const s = (state.settings && state.settings.ratingDays) || {};
   return s[rating] != null ? s[rating] : (RATING_DAYS_DEFAULT[rating] || 0);
 }
+// 客户最后一次跟进日期（没有跟进记录则用创建日期兜底）
+function lastTouchDate(c) {
+  if (c.lastFollowUp && /^\d{4}-\d{2}-\d{2}/.test(c.lastFollowUp)) return c.lastFollowUp.slice(0, 10);
+  if (c.createdAt && /^\d{4}-\d{2}-\d{2}/.test(c.createdAt)) return c.createdAt.slice(0, 10);
+  return null;
+}
+// 距离上次跟进已过去多少天（从未跟进过返回 9999，保证任何阈值都能筛出来）
+function daysSinceLastFollow(c) {
+  const base = lastTouchDate(c);
+  if (!base) return 9999;
+  const ms = new Date(todayStr() + 'T00:00:00') - new Date(base + 'T00:00:00');
+  return Math.max(0, Math.floor(ms / 86400000));
+}
 // 计算单个客户的跟进状态：下次应跟进日期、是否已逾期、逾期天数
 function followUpInfo(c) {
+  const g = custGrade(c);
   let interval = 0;
   if (c.followUpEvery && c.followUpEvery > 0) interval = c.followUpEvery;
-  else if (c.rating && ratingDays(c.rating)) interval = ratingDays(c.rating);
+  else if (g && ratingDays(g)) interval = ratingDays(g);
   if (!interval) interval = (state.settings.followUpDays || 14);
-  const base = (c.lastFollowUp && /^\d{4}-\d{2}-\d{2}/.test(c.lastFollowUp)) ? c.lastFollowUp.slice(0, 10)
-    : (c.createdAt ? c.createdAt.slice(0, 10) : null);
+  const base = lastTouchDate(c);
   if (!base) return { next: null, due: true, interval, daysOverdue: null, base: null };
   const next = addDaysStr(base, interval);
   const today = todayStr();
@@ -492,7 +510,15 @@ const SYS_OEM = '你是一名资深汽车配件（滤清器 / OEM 件）外贸�
 
 const SYS_RESEARCH = '你是一名外贸客户背调专家，擅长通过公开信息评估海外买家。基于公司名/官网输出结构化背调报告。' +
   '只返回 JSON，不要任何额外文字或 markdown 代码块。格式：' +
-  '{"overview":"公司概况","country":"国别/地区（如：德国、美国、东南亚）","industry":"行业（如：汽配、户外用品、建材）","size":"规模(营收/人数估计)","products":"主营产品","markets":"目标市场与渠道","strengths":"优势","risks":"风险与警示","creditHint":"信用/资质提示","suggestedApproach":"开发建议","sources":["信息来源"],"contacts":[{"name":"姓名","title":"职位/头衔","email":"邮箱","phone":"电话"}]}';
+  '{"overview":"公司概况","country":"国别/地区（如：德国、美国、东南亚）","industry":"行业（如：汽配、户外用品、建材）","size":"规模(营收/人数估计)","products":"主营产品","markets":"目标市场与渠道","strengths":"优势","risks":"风险与警示","creditHint":"信用/资质提示","suggestedApproach":"开发建议","sources":["信息来源"],' +
+  '"customer_grade":"A+|A|B|C（综合规模、品类匹配度、采购信号评级：A+极佳、A值得重点跟进、B一般、C低优先；不确定给 B）",' +
+  '"development_stage":"线索（新背调未接触的一律填 线索）",' +
+  '"development_hook":"开发钩子：为什么【现在】值得联系他（如近期在招采购、新上车型、扩品类、有库存缺口），没有可靠依据就留空",' +
+  '"development_strategy":"开发思路：整体打法、先联系谁、主打哪个产品、报价策略，2-4 句，要可执行",' +
+  '"next_action":"下一步动作：一个具体可立即执行的动作（如：发 Ford 滤清器报价单并附 OE 对照表）",' +
+  '"product_matches":[{"customer_product":"客户在卖的产品/型号","hwa_product":"我方对应型号（不确定就留空）","oe":"OE 号或互换号","match_type":"直接交叉|同型号替代|功能替代|潜在匹配|待确认","priority":"A+|A|B|C"}],' +
+  '"contacts":[{"name":"姓名","title":"职位/头衔","email":"邮箱","phone":"电话","linkedin":"LinkedIn 链接或用户名","role":"产品决策|Strategic Sourcing|Purchasing|Owner/CEO|Sales|Technical","priority":"P1|P2|P3","credibility":"已验证|高可信|推测|未验证"}]}' +
+  '规则：1) 禁止编造联系方式，找不到就留空；2) product_matches 最多给 5 条，按优先级排序；3) 不确定就标"待确认"/"推测"，不要硬编。';
 const SYS_MARKET = '你是一名国际市场分析专家，为外贸企业提供进入某市场的决策分析。' +
   '只返回 JSON，不要任何额外文字或 markdown 代码块。格式：' +
   '{"summary":"总体结论","marketSize":"市场规模估计","trends":["趋势"],"competitors":["竞争者/替代渠道"],"entryStrategy":["进入策略"],"risks":["风险"],"chartData":{"labels":["维度名"],"values":[0到100的机会/吸引力评分]}}';
@@ -1292,14 +1318,11 @@ ${searchBlock}
       if (dup) { skipped++; dupNames.push(l.name || '未知公司'); return; }
       if (strict && !l._verified && !l._hasContact) { unverifiedSkipped++; return; }
 
-      // 合并结构化 contacts + email + contactHint 解析
-      let contacts = [];
-      if (Array.isArray(l.contacts) && l.contacts.length) {
-        contacts = l.contacts.map(c => ({
-          name: c.name || '', title: c.title || '', email: c.email || '', phone: c.phone || ''
-        })).filter(c => c.name || c.email || c.phone);
+      // 合并结构化 contacts（含角色/优先级/可信度/LinkedIn）+ email + contactHint 解析
+      let contacts = extractContactsFrom(l);
+      if ((l.email || '').includes('@') && !contacts.some(c => c.email === l.email)) {
+        contacts.push({ name: '', title: '', email: l.email, phone: '', role: '', priority: '', credibility: '', linkedin: '' });
       }
-      if ((l.email || '').includes('@')) contacts.push({ name: '', title: '', email: l.email, phone: '' });
       parseContactsFromHint(l.contactHint).forEach(c => {
         if (!contacts.some(x => x.email === c.email && x.phone === c.phone)) contacts.push(c);
       });
@@ -1312,6 +1335,10 @@ ${searchBlock}
         tags: (l.fit === '潜在客户' ? ['潜在客户'] : []), notes: [], aiReport: null,
         fit: l.fit || '', fitReason: l.fitReason || '', matchReason: l.reason || '',
         leadSource: l.source || '',
+        customerGrade: '', productMatches: [],
+        devHook: l.hook || l.why_now || l.development_hook || '',
+        devStrategy: l.strategy || l.development_strategy || '',
+        nextAction: l.next_action || (l.fit === '潜在客户' ? '发首封开发信 + 确认主营品类' : ''),
         oemNumber: lastOemMeta ? lastOemMeta.oemNumber : '',
         oemFitBrands: lastOemMeta ? lastOemMeta.oemFitBrands : (l.oemFit || ''),
         marketMainBrands: lastOemMeta ? lastOemMeta.marketMainBrands : '',
@@ -1512,11 +1539,11 @@ function paintResearchReport(host, r, name, site) {
       // 直接创建客户（不弹重复确认，除非真重复）
       const dup = findDupCustomer(name, site, '');
       const doCreate = () => {
-        state.customers.push({
+        state.customers.push(Object.assign({
           id: uid(), name, website: site, country: r.country || '', industry: r.industry || '', stage: '线索', source: 'AI背调',
           owner: '', value: 0, channel: '', shopUrl: '', cooperating: false, contacts: k, tags: ['已背调'], notes: [{ date: nowISO(), text: '完成 AI 背调，含 ' + k.length + ' 个联系人' }],
           aiReport: r, createdAt: nowISO(), updatedAt: nowISO(), lastFollowUp: ''
-        });
+        }, warFieldsFromResearch(r)));
         persistAll(); toast('✓ 已新建客户并填入 ' + k.length + ' 个联系人', name, 'ok');
       };
       if (dup) {
@@ -1571,11 +1598,11 @@ function paintResearchReport(host, r, name, site) {
     }
     doDrNew();
     function doDrNew() {
-    state.customers.push({
+    state.customers.push(Object.assign({
       id: uid(), name, website: site, country: r.country || '', industry: r.industry || '', stage: '线索', source: 'AI背调',
       owner: '', value: 0, channel: '', shopUrl: '', cooperating: false, contacts: [], tags: ['已背调'], notes: [{ date: nowISO(), text: '完成 AI 背调' }],
       aiReport: r, createdAt: nowISO(), updatedAt: nowISO(), lastFollowUp: ''
-    });
+    }, warFieldsFromResearch(r)));
     persistAll(); toast('已保存', '新建客户并附背调报告', 'ok');
     }
   });
@@ -1588,6 +1615,12 @@ function paintResearchReport(host, r, name, site) {
     if (r.industry) c.industry = r.industry;
     if (!c.tags.includes('已背调')) c.tags.push('已背调');
     if (site && !c.website) c.website = site;
+    // 作战信息：只补齐空缺，不覆盖用户已手填的内容（评级尤其以人工为准）
+    const wf = warFieldsFromResearch(r);
+    delete wf.stage;                                  // 阶段以 CRM 现状为准，不让背调改
+    if (custGrade(c)) { delete wf.customerGrade; delete wf.rating; }
+    ['devHook', 'devStrategy', 'nextAction', 'productMatches'].forEach(k => { if (c[k]) delete wf[k]; });
+    Object.assign(c, wf);
     persistAll(); toast('已更新', `已更新「${c.name}」的背调报告`, 'ok');
   });
 }
@@ -1763,6 +1796,13 @@ function getFilteredCustomers() {
     if (state.crmCountry && (c.country || '') !== state.crmCountry) return false;
     if (state.crmIndustry && (c.industry || '') !== state.crmIndustry) return false;
     if (state.crmFollowUp === 'due' && !isFollowUpDue(c)) return false;
+    const g = custGrade(c);
+    if (state.crmGrade && state.crmGrade !== '全部') {
+      if (state.crmGrade === '未评级') { if (g) return false; }
+      else if (g !== state.crmGrade) return false;
+    }
+    // 「评级 + N 天没跟进」组合筛选：如 A+ 且 ≥7 天没跟进
+    if (state.crmNoFollowDays > 0 && daysSinceLastFollow(c) < state.crmNoFollowDays) return false;
     if (!q) return true;
     const hay = [c.name, c.country, c.industry, c.website, c.channel, c.shopUrl, (c.tags || []).join(' '), (c.contacts || []).map(k => k.name + k.email).join(' ')].join(' ').toLowerCase();
     return hay.includes(q);
@@ -1819,12 +1859,20 @@ function renderCrm() {
         <input id="crm-filter-search" type="text" placeholder="搜索名称 / 国家 / 行业 / 标签 / 联系人" value="${esc(state.crmSearch)}">
         <select id="crm-filter-stage">${stageOpts}</select>
       </div>
-      <div class="row2" style="flex:1;min-width:320px;gap:10px">
+      <div class="row3" style="flex:1;min-width:320px;gap:10px">
         <select id="crm-filter-country"><option value="">全部国家</option>${countryOpts}</select>
         <select id="crm-filter-industry"><option value="">全部行业</option>${industryOpts}</select>
+        <select id="crm-filter-grade"><option value="全部">全部评级</option>${['A+', 'A', 'B', 'C', '未评级'].map(g => `<option value="${g}" ${state.crmGrade === g ? 'selected' : ''}>${g === '未评级' ? '未评级' : '⭐ ' + g}</option>`).join('')}</select>
       </div>
-      <button class="btn sm ${state.crmFollowUp === 'due' ? 'primary' : ''}" id="crm-filter-followup">🔔 仅看需跟进${dueN ? ` (${dueN})` : ''}</button>
-      <div class="small muted">显示 ${getFilteredCustomers().length} / ${state.customers.length}</div>
+      <div class="flex items-center gap8">
+        <button class="btn sm ${state.crmFollowUp === 'due' ? 'primary' : ''}" id="crm-filter-followup">🔔 仅看需跟进${dueN ? ` (${dueN})` : ''}</button>
+        <select id="crm-filter-nofollow" style="max-width:150px">
+          <option value="0">未跟进：不限</option>
+          ${[3, 7, 14, 30, 60, 90].map(d => `<option value="${d}" ${state.crmNoFollowDays === d ? 'selected' : ''}>≥ ${d} 天没跟进</option>`).join('')}
+        </select>
+        <button class="btn sm ghost" id="crm-filter-reset" title="清空全部筛选">重置</button>
+      </div>
+      <div class="small muted" id="crm-filter-count">显示 ${getFilteredCustomers().length} / ${state.customers.length}</div>
     </div>
   </div>
   <div id="crm-batch" class="card card-pad mb12 batch-bar" style="display:none">
@@ -1850,6 +1898,16 @@ function renderCrm() {
   $('#crm-filter-stage').addEventListener('change', e => { state.crmStage = e.target.value; renderCrmTable(); });
   $('#crm-filter-country').addEventListener('change', e => { state.crmCountry = e.target.value; renderCrmTable(); });
   $('#crm-filter-industry').addEventListener('change', e => { state.crmIndustry = e.target.value; renderCrmTable(); });
+  const gradeSel = $('#crm-filter-grade');
+  if (gradeSel) gradeSel.addEventListener('change', e => { state.crmGrade = e.target.value; renderCrmTable(); });
+  const nfSel = $('#crm-filter-nofollow');
+  if (nfSel) nfSel.addEventListener('change', e => { state.crmNoFollowDays = parseInt(e.target.value, 10) || 0; renderCrmTable(); });
+  const rstBtn = $('#crm-filter-reset');
+  if (rstBtn) rstBtn.addEventListener('click', () => {
+    state.crmSearch = ''; state.crmStage = '全部'; state.crmCountry = ''; state.crmIndustry = '';
+    state.crmGrade = '全部'; state.crmNoFollowDays = 0; state.crmFollowUp = 'all'; state.crmSel.clear();
+    renderCrm();
+  });
   const fuBtn = $('#crm-filter-followup');
   if (fuBtn) fuBtn.addEventListener('click', () => { state.crmFollowUp = state.crmFollowUp === 'due' ? 'all' : 'due'; renderCrm(); });
   const fuBanner = $('#crm-followup-banner');
@@ -1915,6 +1973,8 @@ function renderCrmTable() {
   if (!box) return;
   if (!list.length) {
     box.innerHTML = `<div class="empty"><div class="big">👥</div>${state.customers.length ? '没有匹配的客户' : '还没有客户，点击右上角「新增客户」或去「AI 获客」'}</div>`;
+    updateCrmFilterCount(list);
+    updateCoopBanner();
     return;
   }
   box.innerHTML = `<table class="tbl">
@@ -1922,17 +1982,20 @@ function renderCrmTable() {
     <tbody>
     ${list.map(c => {
       const fu = followUpInfo(c);
+      const g = custGrade(c);
       const due = fu.due && !c.cooperating && !CLOSED_STAGES.includes(c.stage);
+      const idle = daysSinceLastFollow(c);
+      const pmN = (c.productMatches && c.productMatches.length) || 0;
       return `
       <tr data-id="${c.id}" class="${due ? 'row-due' : ''}" style="cursor:pointer">
         <td class="col-sel"><input type="checkbox" class="c-sel" data-id="${c.id}" ${state.crmSel.has(c.id) ? 'checked' : ''}></td>
-        <td><strong>${esc(c.name)}</strong>${c.rating ? ` <span class="badge b-rating b-rating-${esc(c.rating)}" title="评级 ${esc(c.rating)}，每 ${ratingDays(c.rating)} 天跟进">⭐${esc(c.rating)}</span>` : ''}${due ? ` <span class="badge b-due">🔔 需跟进${fu.daysOverdue ? ' · 逾期' + fu.daysOverdue + '天' : ''}</span>` : ''}${c.cooperating ? ` <span class="badge b-coop">🤝 合作</span>` : ''}${(c.tags && c.tags.length) || c.channel ? `<div class="pill-list mt8">${c.channel ? `<span class="chip">${esc(c.channel)}</span>` : ''}${c.tags.map(t => `<span class="chip">${esc(t)}</span>`).join('')}</div>` : ''}</td>
+        <td><strong>${esc(c.name)}</strong>${g ? ` <span class="badge b-rating ${ratingBadgeClass(g)}" title="评级 ${esc(g)}，每 ${ratingDays(g)} 天跟进">⭐${esc(g)}</span>` : ''}${due ? ` <span class="badge b-due">🔔 需跟进${fu.daysOverdue ? ' · 逾期' + fu.daysOverdue + '天' : ''}</span>` : ''}${c.cooperating ? ` <span class="badge b-coop">🤝 合作</span>` : ''}${pmN ? ` <span class="badge b-tag" title="已配 ${pmN} 条产品匹配">🔧${pmN}</span>` : ''}${(c.tags && c.tags.length) || c.channel ? `<div class="pill-list mt8">${c.channel ? `<span class="chip">${esc(c.channel)}</span>` : ''}${c.tags.map(t => `<span class="chip">${esc(t)}</span>`).join('')}</div>` : ''}${c.nextAction ? `<div class="pill-list mt8"><span class="chip" style="border-color:var(--primary);color:var(--primary)" title="下一步动作">➡ ${esc(c.nextAction)}</span></div>` : ''}</td>
         <td>${esc(c.country || '—')}</td>
         <td>${esc(c.industry || '—')}</td>
         <td><span class="badge ${STAGE_CLASS[c.stage] || 'b-tag'}">${esc(c.stage)}</span>${c.cooperating ? ` <span class="badge b-coop">🤝</span>` : ''}${c.fit ? ` <span class="badge ${fitClass(c.fit)}">${esc(c.fit)}</span>` : ''}</td>
         <td>${c.value ? fmtNum(c.value) : '—'}</td>
         <td>${esc(c.owner || '—')}</td>
-        <td>${esc(c.lastFollowUp || '—')}${fu.next ? `<div class="small muted mt4">下次 ${fu.next}</div>` : ''}</td>
+        <td>${esc(c.lastFollowUp || '—')}<div class="small mt4 ${idle >= 30 ? 'muted' : ''}">${idle >= 9999 ? '<span class="muted">从未跟进</span>' : `<span class="muted">${idle} 天没跟</span>`}</div>${fu.next ? `<div class="small muted mt4">下次 ${fu.next}</div>` : ''}</td>
         <td class="text-right nowrap">
           ${due ? `<button class="btn sm primary" data-act="follow">已跟进</button>` : ''}
           <button class="btn sm" data-act="view">查看</button>
@@ -1973,7 +2036,24 @@ function renderCrmTable() {
       renderCrmTable(); updateBatchBar();
     });
   }
+  updateCrmFilterCount(list);
   updateCoopBanner();
+}
+
+// 顶部「显示 X / Y + 当前生效的筛选条件」实时更新
+function updateCrmFilterCount(list) {
+  const cntEl = $('#crm-filter-count');
+  if (!cntEl) return;
+  const active = [];
+  if (state.crmSearch.trim()) active.push('搜索「' + state.crmSearch.trim() + '」');
+  if (state.crmStage !== '全部') active.push(state.crmStage);
+  if (state.crmCountry) active.push(state.crmCountry);
+  if (state.crmIndustry) active.push(state.crmIndustry);
+  if (state.crmGrade !== '全部') active.push('评级 ' + state.crmGrade);
+  if (state.crmNoFollowDays > 0) active.push('≥' + state.crmNoFollowDays + '天没跟进');
+  if (state.crmFollowUp === 'due') active.push('仅需跟进');
+  cntEl.innerHTML = `显示 <b>${(list || []).length}</b> / ${state.customers.length}` +
+    (active.length ? `<div class="small" style="color:var(--primary)">筛选：${esc(active.join(' + '))}</div>` : '');
 }
 
 // 一键标记今天已跟进：更新最近跟进日期，重置提醒
@@ -1991,6 +2071,10 @@ function openCustomerForm(id) {
   const c = id ? state.customers.find(x => x.id === id) : null;
   const v = c || { name: '', website: '', country: '', industry: '', stage: '线索', source: '', owner: '', value: 0, contacts: [], tags: [], notes: [], leadSource: '', oemNumber: '', oemFitBrands: '', marketMainBrands: '' };
   const contacts = (v.contacts && v.contacts.length ? v.contacts : [{}]).map(k => contactRow(k)).join('');
+  // 产品匹配：老客户若只有旧的「核心产品匹配」文本，打开编辑时自动拆成结构化条目（保存后才真正落库）
+  let pmList = (v.productMatches && v.productMatches.length) ? v.productMatches.slice() : [];
+  if (!pmList.length && v.coreProductMatch) pmList = extractProductMatchesFrom({ core_product_match: v.coreProductMatch });
+  const pms = pmList.map(m => productMatchRow(m)).join('');
   const tags = (v.tags || []).map(t => `<span class="chip" data-tag="${esc(t)}">${esc(t)} <button data-deltag>×</button></span>`).join('');
 
   showModal(`
@@ -1999,7 +2083,7 @@ function openCustomerForm(id) {
       <textarea id="f-ai-json" placeholder='把 ChatGPT 给你的 JSON 直接粘到这里，点「解析填充」自动填入所有字段。示例：{"company_name":"ABC Corp","country_region":"United States","industry":"Auto Parts","website":"https://abc.com","tags":["A+客户"],"contact":{"name":"John","title":"CEO","email":"john@abc.com","phone":"+1-555-0123"}}' style="min-height:60px;font-family:Consolas,monospace;font-size:12px"></textarea>
       <div class="flex gap8 mt8">
         <button class="btn sm primary" id="f-ai-parse" type="button">⚡ 解析填充</button>
-        <span class="small muted" style="align-self:center">支持字段：company_name/country_region/industry/website/owner/value/source/source_channel/tags/contact/first_quote_sent/oem等</span>
+        <span class="small muted" style="align-self:center">支持：company_name / country_region / industry / website / store_listing_url / source / source_channel / <b>customer_grade</b> / development_stage / <b>development_hook</b> / <b>development_strategy</b> / <b>next_action</b> / followup_days / tags / <b>product_matches[]</b> / contacts[]（含 role·priority·credibility·linkedin）</span>
       </div>
     </div>
     <div class="field"><label>公司名称 <span class="req">*</span></label><input id="f-name" type="text" value="${esc(v.name)}"></div>
@@ -2046,19 +2130,26 @@ function openCustomerForm(id) {
     </div>` : ''}
     <div class="divider"></div>
     <div class="card card-pad" style="background:linear-gradient(135deg,rgba(99,102,241,0.05),rgba(16,185,129,0.03))">
-      <div class="card-title" style="font-size:13px">🎯 开发作战信息</div>
-      <div class="field"><label>开发钩子 <span class="small muted">（为什么现在值得联系他）</span></label>
-        <input id="f-dev-hook" type="text" value="${esc(v.devHook || '')}" placeholder="如：近期在招采购、刚上架 Ford 新款、展会新客户">
+      <div class="card-title" style="font-size:13px">🎯 开发作战信息 <span class="small muted">（固定 4 项 · 打开客户就能看到）</span></div>
+      <div class="row2">
+        <div class="field"><label>① 开发阶段</label>
+          <select id="f-dev-stage">${STAGES.map(s => `<option ${v.stage === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
+        </div>
+        <div class="field"><label>② 开发钩子 <span class="small muted">（为什么现在联系他）</span></label>
+          <input id="f-dev-hook" type="text" value="${esc(v.devHook || '')}" placeholder="如：近期在招采购、刚上架 Ford 新款、展会新客户">
+        </div>
       </div>
-      <div class="field"><label>核心产品匹配 <span class="small muted">（客户产品 ↔ HWA型号 / OE）</span></label>
-        <input id="f-core-match" type="text" value="${esc(v.coreProductMatch || '')}" placeholder="如：FD-4625 ↔ HWA-880 / OE U212-13-480">
-      </div>
-      <div class="field"><label>下一步动作 <span class="small muted">（下一次具体做什么）</span></label>
-        <input id="f-next-action" type="text" value="${esc(v.nextAction || '')}" placeholder="如：发报价单、寄样、确认 OE 号">
-      </div>
-      <div class="field"><label>开发思路 <span class="small muted">（长文本：整体打法、联系人顺序、产品策略）</span></label>
+      <div class="field"><label>③ 开发思路 <span class="small muted">（整体打法：先找谁、主打什么、报价策略）</span></label>
         <textarea id="f-dev-strategy" placeholder="整体打法、先联系谁、主打哪个产品、报价策略…">${esc(v.devStrategy || '')}</textarea>
       </div>
+      <div class="field"><label>④ 下一步动作 <span class="small muted">（下一次具体做什么）</span></label>
+        <input id="f-next-action" type="text" value="${esc(v.nextAction || '')}" placeholder="如：发报价单、寄样、确认 OE 号">
+      </div>
+    </div>
+    <div class="card card-pad mt12" style="background:var(--panel-2)">
+      <div class="card-title" style="font-size:13px">🔧 产品匹配 <span class="small muted">（客户产品 ↔ 昊威型号 ↔ OE，可多条）</span></div>
+      <div id="f-pm">${pms}</div>
+      <button class="btn sm mt8" id="f-add-pm" type="button">＋ 添加产品匹配</button>
     </div>
     <div class="field"><label>标签</label>
       <div class="tag-input" id="f-tags">${tags}<input id="f-tag-input" type="text" placeholder="输入后回车添加" style="width:140px"></div>
@@ -2115,23 +2206,27 @@ function openCustomerForm(id) {
     if (obj.oem_number) { const el = $('#f-oem-number'); if (el && !el.value) el.value = obj.oem_number; }
     if (obj.oem_fit_brands) { setIf('f-oem-fit', obj.oem_fit_brands); }
     if (obj.market_main_brands) { setIf('f-market-brands', obj.market_main_brands); }
-    // 开发作战信息（新字段）
-    setIf('f-dev-hook', obj.dev_hook || obj.hook || obj.devHook || obj.why_now || obj.开发钩子);
-    setIf('f-core-match', obj.core_product_match || obj.coreProductMatch || obj.product_match || obj.model_match || obj.核心产品匹配);
+    // 开发作战信息（新字段，兼容 dev_hook / development_hook 两种命名）
+    setIf('f-dev-hook', obj.development_hook || obj.dev_hook || obj.hook || obj.devHook || obj.why_now || obj.开发钩子);
     setIf('f-next-action', obj.next_action || obj.nextAction || obj.next_step || obj.下一步动作);
-    setIf('f-dev-strategy', obj.dev_strategy || obj.strategy || obj.devStrategy || obj.approach || obj.开发思路);
-    // 开发阶段（如果在 STAGES 里能匹配上就自动选）
+    setIf('f-dev-strategy', obj.development_strategy || obj.dev_strategy || obj.strategy || obj.devStrategy || obj.approach || obj.开发思路);
+    // 开发阶段（如果在 STAGES 里能匹配上就自动选；两个下拉都要同步，否则保存时会被旧值覆盖）
     const stageRaw = obj.development_stage || obj.stage || obj.dev_stage || obj.开发阶段;
     if (stageRaw) {
       const st = String(stageRaw).trim();
       const hit = STAGES.find(s => s === st || st.includes(s) || s.includes(st));
-      if (hit) { const el = $('#f-stage'); if (el) el.value = hit; }
+      if (hit) { ['f-stage', 'f-dev-stage'].forEach(id => { const el = $('#' + id); if (el) el.value = hit; }); }
     }
-    // 客户评级（A+/A/B/C）
-    const ratingRaw = obj.rating || obj.customer_rating || obj.grade || obj.level || obj.客户评级;
+    // 客户评级（A+/A/B/C）—— 独立 customer_grade 字段，兼容多种命名
+    const ratingRaw = obj.customer_grade || obj.rating || obj.customer_rating || obj.grade || obj.level || obj.客户评级 || obj.评级;
     if (ratingRaw) {
-      const rr = String(ratingRaw).trim().toUpperCase();
-      const hitR = RATINGS.find(r => r === rr || rr.includes(r));
+      const rr = String(ratingRaw).trim().toUpperCase().replace('＋', '+');
+      let hitR = RATINGS.find(r => r === rr);
+      if (!hitR) {
+        // 兼容 "A+ 战略客户" / "Grade A" / "A级" 这类写法
+        const m2 = rr.replace(/\s+/g, '').match(/^(A\+|A|B|C|D)/);
+        if (m2 && RATINGS.includes(m2[1])) hitR = m2[1];
+      }
       if (hitR) { const el = $('#f-rating'); if (el) { el.value = hitR; if (typeof updPreview === 'function') updPreview(); } }
     }
     // 标签
@@ -2150,10 +2245,27 @@ function openCustomerForm(id) {
           tmp.innerHTML = contactRow(k);
           box.appendChild(tmp.firstElementChild);
         });
+        $all('#f-contacts > div').forEach(bindContact);
+      }
+    }
+    // 产品匹配（多条）
+    const pms = extractProductMatchesFrom(obj);
+    if (pms.length) {
+      const box = $('#f-pm');
+      if (box) {
+        box.innerHTML = '';
+        pms.forEach(m => {
+          const tmp = document.createElement('div');
+          tmp.innerHTML = productMatchRow(m);
+          box.appendChild(tmp.firstElementChild);
+        });
+        $all('#f-pm > div').forEach(bindProductMatch);
       }
     }
     const filled = ['f-name', 'f-country', 'f-website', 'f-industry'].filter(id => $('#' + id) && $('#' + id).value).length;
-    toast('✓ 已填充', `共 ${filled} 个核心字段 + ${tagArr.length} 标签` + (contacts.length ? ` + ${contacts.length} 个联系人` : ''), 'ok');
+    toast('✓ 已填充', `共 ${filled} 个核心字段 + ${tagArr.length} 标签` +
+      (contacts.length ? ` + ${contacts.length} 个联系人` : '') +
+      (pms.length ? ` + ${pms.length} 条产品匹配` : ''), 'ok');
   });
 
   $('#f-add-contact').addEventListener('click', () => {
@@ -2162,6 +2274,22 @@ function openCustomerForm(id) {
     bindContact(box.lastElementChild);
   });
   $all('#f-contacts > div').forEach(bindContact);
+
+  // 产品匹配：添加 / 删除
+  $('#f-add-pm').addEventListener('click', () => {
+    const box = $('#f-pm');
+    const tmp = document.createElement('div'); tmp.innerHTML = productMatchRow({}); box.appendChild(tmp.firstElementChild);
+    bindProductMatch(box.lastElementChild);
+  });
+  $all('#f-pm > div').forEach(bindProductMatch);
+
+  // 阶段双向同步：基本信息区的 #f-stage 与作战区的 #f-dev-stage 保持一致
+  const sTop = $('#f-stage'), sWar = $('#f-dev-stage');
+  if (sTop && sWar) {
+    sWar.value = sTop.value;
+    sTop.addEventListener('change', () => { sWar.value = sTop.value; });
+    sWar.addEventListener('change', () => { sTop.value = sWar.value; });
+  }
 
   // 评级/周期变化时实时更新预览
   const updPreview = () => {
@@ -2195,12 +2323,16 @@ function openCustomerForm(id) {
       credibility: ($('[data-c="cred"]', row) || {}).value ? $('[data-c="cred"]', row).value.trim() : '',
       linkedin: ($('[data-c="linkedin"]', row) || {}).value ? $('[data-c="linkedin"]', row).value.trim() : ''
     })).filter(k => k.name || k.email || k.phone || k.linkedin);
+    const gradeVal = ($('#f-rating') && $('#f-rating').value) || '';
     const data = {
       name, website, country: $('#f-country').value.trim(),
-      industry: $('#f-industry').value.trim(), stage: $('#f-stage').value, owner: $('#f-owner').value.trim(),
+      industry: $('#f-industry').value.trim(),
+      stage: ($('#f-dev-stage') ? $('#f-dev-stage').value : $('#f-stage').value),
+      owner: $('#f-owner').value.trim(),
       value: ($('#f-value').value.trim() ? (parseFloat($('#f-value').value) || 0) : ''),       source: $('#f-source').value.trim(),
       channel: $('#f-channel').value.trim(), shopUrl, cooperating: $('#f-cooperating').checked,
-      rating: ($('#f-rating') && $('#f-rating').value) || '',
+      rating: gradeVal,
+      customerGrade: gradeVal,   // 独立评级字段（与 rating 同值，便于按等级筛选）
       followUpEvery: parseInt($('#f-follow-every').value, 10) || 0,
       lastFollowUp: ($('#f-last-follow') ? $('#f-last-follow').value : (c && c.lastFollowUp) || ''),
       contacts, tags: tagArr,
@@ -2209,12 +2341,13 @@ function openCustomerForm(id) {
       oemFitBrands: ($('#f-oem-fit') ? $('#f-oem-fit').value.trim() : (c && c.oemFitBrands) || ''),
       marketMainBrands: ($('#f-market-brands') ? $('#f-market-brands').value.trim() : (c && c.marketMainBrands) || ''),
       devHook: ($('#f-dev-hook') ? $('#f-dev-hook').value.trim() : (c && c.devHook) || ''),
-      coreProductMatch: ($('#f-core-match') ? $('#f-core-match').value.trim() : (c && c.coreProductMatch) || ''),
+      coreProductMatch: (c && c.coreProductMatch) || '',   // 旧字段保留（不展示，仅兼容历史数据）
       nextAction: ($('#f-next-action') ? $('#f-next-action').value.trim() : (c && c.nextAction) || ''),
-      devStrategy: ($('#f-dev-strategy') ? $('#f-dev-strategy').value.trim() : (c && c.devStrategy) || '')
+      devStrategy: ($('#f-dev-strategy') ? $('#f-dev-strategy').value.trim() : (c && c.devStrategy) || ''),
+      productMatches: collectProductMatches()
     };
     if (c) { Object.assign(c, data, { updatedAt: nowISO() }); toast('已更新', name, 'ok'); }
-    else { state.customers.push(Object.assign({ id: uid(), notes: [], aiReport: null, createdAt: nowISO(), updatedAt: nowISO(), lastFollowUp: '', fit: '', fitReason: '', matchReason: '', leadSource: '', oemNumber: '', oemFitBrands: '', marketMainBrands: '' }, data)); toast('已新增', name, 'ok'); }
+    else { state.customers.push(Object.assign({ id: uid(), notes: [], aiReport: null, createdAt: nowISO(), updatedAt: nowISO(), lastFollowUp: '', fit: '', fitReason: '', matchReason: '', leadSource: '', oemNumber: '', oemFitBrands: '', marketMainBrands: '', productMatches: [], customerGrade: '', devHook: '', devStrategy: '', nextAction: '' }, data)); toast('已新增', name, 'ok'); }
     persistAll(); closeModal(); renderCrm();
   });
 }
@@ -2249,6 +2382,110 @@ function bindContact(row) {
   if (del) del.addEventListener('click', () => { row.remove(); });
 }
 
+// ---------- 产品匹配（多条，同联系人结构）----------
+function productMatchRow(m) {
+  const sel = (attr, opts, cur) => `<select data-m="${attr}"><option value="">—</option>${opts.map(o =>
+    `<option value="${esc(o)}" ${cur === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+  return `<div class="contact-block pm-block">
+    <div class="row2">
+      <input data-m="customer_product" type="text" placeholder="客户产品（如 Prime Guard PDF76160）" value="${esc(m.customerProduct || m.customer_product || '')}">
+      <input data-m="hwa_product" type="text" placeholder="昊威产品（如 HWA-068）" value="${esc(m.hwaProduct || m.hwa_product || '')}">
+    </div>
+    <div class="row3">
+      <input data-m="oe" type="text" placeholder="OE 号（如 FD-4615 / BC3Z9N184B）" value="${esc(m.oe || '')}">
+      ${sel('match_type', MATCH_TYPES, m.matchType || m.match_type || '')}
+      ${sel('priority', RATINGS, m.priority || '')}
+    </div>
+    <div>
+      <button type="button" class="btn sm danger pm-del" title="删除该条">✕ 删除</button>
+    </div>
+  </div>`;
+}
+function bindProductMatch(row) {
+  const del = row.querySelector('.pm-del');
+  if (del) del.addEventListener('click', () => { row.remove(); });
+}
+function collectProductMatches() {
+  return $all('#f-pm > div').map(row => ({
+    customerProduct: (($('[data-m="customer_product"]', row) || {}).value || '').trim(),
+    hwaProduct: (($('[data-m="hwa_product"]', row) || {}).value || '').trim(),
+    oe: (($('[data-m="oe"]', row) || {}).value || '').trim(),
+    matchType: (($('[data-m="match_type"]', row) || {}).value || '').trim(),
+    priority: (($('[data-m="priority"]', row) || {}).value || '').trim()
+  })).filter(m => m.customerProduct || m.hwaProduct || m.oe);
+}
+// 从 AI / ChatGPT 返回的顶层对象里抽取产品匹配（支持数组、单对象、"A ↔ B / OE" 字符串）
+function extractProductMatchesFrom(raw) {
+  const out = [];
+  const normType = v => {
+    if (!v) return '';
+    const s = String(v).trim();
+    const hit = MATCH_TYPES.find(t => t === s || s.includes(t) || t.includes(s));
+    return hit || s;
+  };
+  const normPrio = v => {
+    if (!v) return '';
+    const s = String(v).trim().toUpperCase().replace('＋', '+');
+    const hit = RATINGS.find(r => r === s);
+    if (hit) return hit;
+    const m3 = s.replace(/\s+/g, '').match(/^(A\+|A|B|C|D)/);
+    return (m3 && RATINGS.includes(m3[1])) ? m3[1] : s;
+  };
+  const pick = o => {
+    if (o == null) return;
+    if (typeof o === 'string') {
+      let parts = o.split(/[→↔>|=]+/).map(s => s.trim()).filter(Boolean);
+      // "客户产品 ↔ HWA-068 / FD-4615"：后半段含 / 时，再把 OE 拆出来
+      if (parts.length === 2 && parts[1].indexOf('/') >= 0) {
+        const t = parts[1].split('/').map(s => s.trim()).filter(Boolean);
+        parts = [parts[0], t[0], t.slice(1).join(' / ')];
+      }
+      out.push({ customerProduct: parts[0] || o.trim(), hwaProduct: parts[1] || '', oe: parts[2] || '', matchType: '', priority: '' });
+      return;
+    }
+    if (Array.isArray(o)) { o.forEach(pick); return; }
+    if (typeof o === 'object') {
+      const cp = o.customer_product || o.customerProduct || o.customer_product_name || o.client_product || o.product || o.客户产品 || '';
+      const hp = o.hwa_product || o.hwaProduct || o.hwa_model || o.our_product || o.our_model || o.昊威产品 || o.昊威型号 || '';
+      const oe = o.oe || o.oe_number || o.oeNumber || o.oem || o.oem_number || o.OE || o.oe号 || '';
+      if (!cp && !hp && !oe) return;
+      out.push({
+        customerProduct: String(cp), hwaProduct: String(hp), oe: String(oe),
+        matchType: normType(o.match_type || o.matchType || o.type || o.匹配类型 || ''),
+        priority: normPrio(o.priority || o.prio || o.优先级 || '')
+      });
+    }
+  };
+  const src = raw.product_matches || raw.productMatches || raw.product_match || raw.matches || raw.products_matched || raw.产品匹配;
+  // 兼容：顶层只有 core_product_match 字符串时也拆成一条
+  const alt = raw.core_product_match || raw.coreProductMatch || raw.product_match_summary || raw.核心产品匹配;
+  if (src) pick(src);
+  if (!out.length && alt) pick(alt);
+  return out;
+}
+// 从 AI 背调结果里抽出「评级 + 开发作战信息 + 产品匹配」，直接落到客户上
+function warFieldsFromResearch(r) {
+  if (!r || typeof r !== 'object') return {};
+  const out = {};
+  const g = String(r.customer_grade || r.customerGrade || '').trim().toUpperCase().replace('＋', '+');
+  if (g && RATINGS.includes(g)) { out.customerGrade = g; out.rating = g; }
+  const st = String(r.development_stage || r.stage || '').trim();
+  if (st) { const hit = STAGES.find(s => s === st || st.includes(s)); if (hit) out.stage = hit; }
+  ['devHook|development_hook|dev_hook', 'devStrategy|development_strategy|dev_strategy', 'nextAction|next_action']
+    .forEach(spec => {
+      const [key, ...alts] = spec.split('|');
+      for (const a of alts) { if (r[a] != null && String(r[a]).trim()) { out[key] = String(r[a]).trim(); return; } }
+    });
+  const pms = extractProductMatchesFrom(r);
+  if (pms.length) out.productMatches = pms;
+  return out;
+}
+
+// 客户评级：独立 customer_grade 字段，向下兼容老的 rating 字段
+function custGrade(c) { return (c && (c.customerGrade || c.rating)) || ''; }
+// 评级徽章的 CSS 后缀：A+ → g-Aplus（避免 "+" 出现在 class 名里）
+function ratingBadgeClass(g) { return 'g-' + String(g || '').replace(/\+/g, 'plus').replace(/[^a-zA-Z0-9]/g, '') || 'g-none'; }
+
 function openCustomerDetail(id) {
   const c = state.customers.find(x => x.id === id);
   if (!c) return;
@@ -2271,6 +2508,21 @@ function openCustomerDetail(id) {
     </div>
   </div>`).join('') : '<div class="muted small">暂无联系人</div>';
   const notes = (c.notes && c.notes.length) ? c.notes.slice().reverse().map(n => `<div class="note-item"><div class="meta">${fmtDate(n.date)}</div>${esc(n.text)}</div>`).join('') : '<div class="muted small">暂无跟进记录</div>';
+  // 产品匹配（多条）→「我们能卖他什么」
+  const _pms = (c.productMatches && c.productMatches.length) ? c.productMatches : [];
+  const pmBlock = _pms.length ? `<div class="card card-pad mt16">
+      <div class="card-title">🔧 产品匹配 <span class="small muted">（客户产品 ↔ 昊威型号 ↔ OE）</span></div>
+      <div class="pm-table-wrap"><table class="pm-table">
+        <thead><tr><th>客户产品</th><th>昊威产品</th><th>OE 号</th><th>匹配类型</th><th>优先级</th></tr></thead>
+        <tbody>${_pms.map(m => `<tr>
+          <td>${esc(m.customerProduct || '—')}</td>
+          <td>${m.hwaProduct ? `<b style="color:var(--primary)">${esc(m.hwaProduct)}</b>` : '—'}</td>
+          <td class="mono">${esc(m.oe || '—')}</td>
+          <td>${m.matchType ? `<span class="badge ${MATCH_CLASS[m.matchType] || 'b-tag'}">${esc(m.matchType)}</span>` : '—'}</td>
+          <td>${m.priority ? `<span class="badge b-rating">${esc(m.priority)}</span>` : '—'}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+    </div>` : '';
   const report = c.aiReport ? `<div class="card card-pad mt16"><div class="card-title">🤖 AI 背调报告</div>
     ${c.aiReport.overview ? `<div class="small"><b>概况：</b>${esc(c.aiReport.overview)}</div>` : ''}
     ${c.aiReport.strengths ? `<div class="small mt8"><b>优势：</b>${esc(c.aiReport.strengths)}</div>` : ''}
@@ -2283,6 +2535,7 @@ function openCustomerDetail(id) {
       <div><h3 style="font-size:18px;margin:0">${esc(c.name)}</h3>
         <div class="muted small mt8">${esc(c.country || '')} · ${esc(c.industry || '')} · 来源：${esc(c.source || '—')}</div></div>
       <div class="flex items-center gap8">
+        ${custGrade(c) ? `<span class="badge b-rating">⭐ ${esc(custGrade(c))}</span>` : ''}
         ${c.cooperating ? `<span class="badge b-coop">🤝 合作</span>` : ''}
         ${c.fit ? `<span class="badge ${fitClass(c.fit)}">${esc(c.fit)}</span>` : ''}
         <span class="badge ${STAGE_CLASS[c.stage] || 'b-tag'}">${esc(c.stage)}</span>
@@ -2298,6 +2551,7 @@ function openCustomerDetail(id) {
       ${c.oemFitBrands ? `<span class="k">适配品牌/车型</span><span>${esc(c.oemFitBrands)}</span>` : ''}
       ${c.marketMainBrands ? `<span class="k">市场主流品牌</span><span>${esc(c.marketMainBrands)}</span>` : ''}
       <span class="k">负责人</span><span>${esc(c.owner || '—')}</span>
+      <span class="k">客户评级</span><span>${custGrade(c) ? `<span class="badge b-rating">⭐ ${esc(custGrade(c))}</span> <span class="muted small">（每 ${ratingDays(custGrade(c))} 天跟进）</span>` : '<span class="muted">未评级</span>'}</span>
       <span class="k">预估价值</span><span>${c.value ? fmtNum(c.value) : '—'}</span>
       <span class="k">最近跟进</span><span>${esc(c.lastFollowUp || '—')}</span>
       <span class="k">下次跟进</span><span>${isFollowUpDue(c) ? `<span class="badge b-due">🔔 需跟进${followUpInfo(c).daysOverdue ? ' · 逾期 ' + followUpInfo(c).daysOverdue + ' 天' : ''}</span>` : (followUpInfo(c).next ? esc(followUpInfo(c).next) : '—')}</span>
@@ -2310,15 +2564,31 @@ function openCustomerDetail(id) {
       ${c.matchReason ? `<div class="small mt8"><b>匹配理由：</b>${esc(c.matchReason)}</div>` : ''}
     </div>` : ''}
     ${report}
-    ${(c.devHook || c.coreProductMatch || c.nextAction || c.devStrategy) ? `<div class="card card-pad mt16" style="background:linear-gradient(135deg,rgba(99,102,241,0.06),rgba(16,185,129,0.04))">
+    <div class="card card-pad mt16" style="background:linear-gradient(135deg,rgba(99,102,241,0.06),rgba(16,185,129,0.04))">
       <div class="card-title">🎯 开发作战信息</div>
-      ${c.devHook ? `<div class="small mt8"><b>开发钩子：</b>${esc(c.devHook)}</div>` : ''}
-      ${c.coreProductMatch ? `<div class="small mt8"><b>核心产品匹配：</b>${esc(c.coreProductMatch)}</div>` : ''}
-      ${c.nextAction ? `<div class="small mt8"><b>下一步动作：</b><span style="color:var(--primary);font-weight:600">${esc(c.nextAction)}</span></div>` : ''}
-      ${c.devStrategy ? `<div class="small mt8"><b>开发思路：</b><div style="white-space:pre-wrap;margin-top:4px">${esc(c.devStrategy)}</div></div>` : ''}
-    </div>` : ''}
+      <div class="war-grid">
+        <div class="war-item">
+          <div class="war-k">① 开发阶段</div>
+          <div class="war-v"><span class="badge ${STAGE_CLASS[c.stage] || 'b-tag'}">${esc(c.stage || '—')}</span></div>
+        </div>
+        <div class="war-item">
+          <div class="war-k">② 开发钩子</div>
+          <div class="war-v">${c.devHook ? esc(c.devHook) : '<span class="muted">未填写</span>'}</div>
+        </div>
+        <div class="war-item war-span">
+          <div class="war-k">③ 开发思路</div>
+          <div class="war-v pre">${c.devStrategy ? esc(c.devStrategy) : '<span class="muted">未填写</span>'}</div>
+        </div>
+        <div class="war-item war-span">
+          <div class="war-k">④ 下一步动作</div>
+          <div class="war-v act">${c.nextAction ? esc(c.nextAction) : '<span class="muted">未填写</span>'}</div>
+        </div>
+      </div>
+      ${c.coreProductMatch ? `<div class="small mt8 muted"><b>历史核心匹配：</b>${esc(c.coreProductMatch)}</div>` : ''}
+    </div>
+    ${pmBlock}
     <div class="card card-pad mt16">
-      <div class="card-title">联系人</div>${contacts}
+      <div class="card-title">联系人 <span class="small muted">（按 P1 → P2 → P3 排序）</span></div>${contacts}
     </div>
     <div class="card card-pad mt16">
       <div class="card-title">跟进记录</div>
