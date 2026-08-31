@@ -419,6 +419,61 @@ function findDupCustomer(name, website, shopUrl) {
   });
 }
 
+// JSON 追加导入时使用：保留现有 CRM 已维护内容，只补充新信息并合并数组字段。
+function mergeImportedCustomer(existing, incoming, importStamp) {
+  if (!existing || !incoming) return existing;
+  const protectedKeys = new Set(['id', 'createdAt', 'contacts', 'tags', 'notes', 'productMatches']);
+  Object.keys(incoming).forEach(k => {
+    if (protectedKeys.has(k)) return;
+    const oldVal = existing[k];
+    const newVal = incoming[k];
+    // 默认不覆盖已经存在的人工维护内容；只填当前为空的字段。
+    const oldEmpty = oldVal === undefined || oldVal === null || oldVal === '' || (Array.isArray(oldVal) && !oldVal.length);
+    const newUseful = newVal !== undefined && newVal !== null && newVal !== '';
+    if (oldEmpty && newUseful) existing[k] = newVal;
+  });
+
+  const contactKey = c => [normKey(c && c.email), normKey(c && c.phone), normKey(c && c.name), normKey(c && c.linkedin)].join('|');
+  const mergedContacts = [];
+  const seenContacts = new Set();
+  [...(existing.contacts || []), ...(incoming.contacts || [])].forEach(c => {
+    if (!c || typeof c !== 'object') return;
+    const key = contactKey(c);
+    // 全空联系人不导入；有信息但 key 碰撞时保留现有版本。
+    if (!key.replace(/\|/g, '')) return;
+    if (seenContacts.has(key)) return;
+    seenContacts.add(key);
+    mergedContacts.push(c);
+  });
+  existing.contacts = mergedContacts;
+
+  const mergePrimitiveArray = (a, b) => {
+    const out = [];
+    const seen = new Set();
+    [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])].forEach(v => {
+      const key = typeof v === 'string' ? normKey(v) : JSON.stringify(v);
+      if (!key || seen.has(key)) return;
+      seen.add(key); out.push(v);
+    });
+    return out;
+  };
+  existing.tags = mergePrimitiveArray(existing.tags, incoming.tags);
+  existing.productMatches = mergePrimitiveArray(existing.productMatches, incoming.productMatches);
+
+  // 跟进备注采用追加，但避免完全相同的备注重复出现。
+  const noteSeen = new Set();
+  existing.notes = [...(existing.notes || []), ...(incoming.notes || [])].filter(n => {
+    if (!n) return false;
+    const key = typeof n === 'string' ? normKey(n) : normKey((n.date || '') + '|' + (n.text || ''));
+    if (!key || noteSeen.has(key)) return false;
+    noteSeen.add(key); return true;
+  });
+
+  existing._ftImportedAt = importStamp;
+  existing.updatedAt = existing.updatedAt || incoming.updatedAt || importStamp;
+  return existing;
+}
+
 function toast(title, msg, type) {
   const root = $('#toast-root');
   const t = document.createElement('div');
@@ -3536,11 +3591,11 @@ function renderSettings() {
       <div class="field"><label>客户数据</label>
         <div class="flex gap8 wrap">
           <button class="btn" id="st-export">导出 JSON</button>
-          <button class="btn" id="st-import">导入 JSON</button>
+          <button class="btn" id="st-import">导入 JSON（新增）</button>
           <button class="btn" id="st-trash">🗑 回收站（${Object.keys(state.trash || {}).length}）</button>
           <button class="btn danger" id="st-clear">彻底清空全部</button>
         </div>
-        <div class="help" style="margin-top:6px">单个删除的客户会在回收站保留 30 天；「彻底清空全部」会同时清理已连接的 Supabase 数据，且不可恢复。</div>
+        <div class="help" style="margin-top:6px">「导入 JSON（新增）」会保留当前客户，只追加新客户；同一公司会智能合并联系人、标签和空缺字段，不会整表覆盖。单个删除的客户会在回收站保留 30 天；「彻底清空全部」会同时清理已连接的 Supabase 数据，且不可恢复。</div>
       </div>
       <div class="divider"></div>
       <div class="field"><label>外观</label>
@@ -3748,21 +3803,49 @@ function renderSettings() {
     if (!r.ok) { if (!r.canceled) toast('导入失败', r.error || '', 'err'); return; }
     const d = r.data || {};
     if (!Array.isArray(d.customers)) { toast('格式错误', '文件不包含 customers 数组', 'err'); return; }
-    if (!confirm(`将导入 ${d.customers.length} 个客户，覆盖当前数据，确定继续？`)) return;
-    // “导入 JSON”是用户明确的新数据集。旧文件里的 updatedAt/createdAt 可能早于最近一次全量清空，
-    // 所以给本次导入加独立时间戳，并撤销同 ID 的旧墓碑/待删项，避免上传后被 clear marker 误判为旧数据。
+    const beforeCount = state.customers.length;
+    if (!confirm(`将新增导入 ${d.customers.length} 个客户。\n当前已有 ${beforeCount} 个客户，原有客户不会被清空。\n若检测到同一公司，将智能合并而不是重复创建。\n\n确定继续？`)) return;
+
+    // 追加导入：保留当前 CRM，只把新客户追加进来；同 ID / 同公司则智能合并。
+    // 同时给本次导入打时间戳并撤销旧墓碑，确保重新上传 Supabase 时不会被历史清空标记误删。
     const importStamp = nowISO();
-    const imported = d.customers.map(c => Object.assign({}, c, { _ftImportedAt: importStamp }));
-    const importedIds = new Set(imported.map(c => c && c.id).filter(Boolean));
-    importedIds.forEach(id => {
+    let added = 0, merged = 0, invalid = 0;
+    const reactivatedIds = new Set();
+
+    d.customers.forEach(raw => {
+      if (!raw || typeof raw !== 'object') { invalid++; return; }
+      const incoming = Object.assign({}, raw, { _ftImportedAt: importStamp });
+      if (!incoming.id) incoming.id = uid();
+
+      let existing = state.customers.find(c => c && c.id === incoming.id);
+      if (!existing) existing = findDupCustomer(incoming.name, incoming.website, incoming.shopUrl);
+
+      if (existing) {
+        mergeImportedCustomer(existing, incoming, importStamp);
+        reactivatedIds.add(existing.id);
+        merged++;
+      } else {
+        state.customers.push(incoming);
+        reactivatedIds.add(incoming.id);
+        added++;
+      }
+    });
+
+    // 本次明确重新导入的数据不能继续留在回收站/待删队列里。
+    reactivatedIds.forEach(id => {
       if (state.tombstones) delete state.tombstones[id];
       if (state.trash) delete state.trash[id];
     });
-    state.pendingDeletes = (state.pendingDeletes || []).filter(id => !importedIds.has(id));
-    state.customers = imported;
-    state.aiHistory = Array.isArray(d.aiHistory) ? d.aiHistory : [];
-    state.marketAnalyses = Array.isArray(d.marketAnalyses) ? d.marketAnalyses : [];
-    persistAll(); toast('导入完成', `${state.customers.length} 个客户，可安全重新上传云端`, 'ok'); render();
+    state.pendingDeletes = (state.pendingDeletes || []).filter(id => !reactivatedIds.has(id));
+
+    // “新增导入”只处理客户，不覆盖现有 AI 历史和市场分析。
+    persistAll();
+    let msg = `新增 ${added} 个`;
+    if (merged) msg += `，合并 ${merged} 个重复客户`;
+    if (invalid) msg += `，跳过 ${invalid} 条无效数据`;
+    msg += `；当前共 ${state.customers.length} 个客户`;
+    toast('导入完成', msg, 'ok');
+    render();
   });
 
   const trashBtn = $('#st-trash');
