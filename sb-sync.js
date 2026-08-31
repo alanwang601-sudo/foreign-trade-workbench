@@ -46,6 +46,17 @@
   function status(msg, type) { if (SB.onStatus) { try { SB.onStatus(msg, type); } catch (e) {} } }
   function getState() { return window.__ftState || {}; }
 
+
+  // 记录的“最近一次有效活动时间”。业务字段 updatedAt/createdAt 可能来自旧备份，
+  // 因此同步层还要考虑 syncedAt / _ftImportedAt，避免全量清空标记误杀刚重新导入的数据。
+  function customerClock(rec) {
+    if (!rec) return 0;
+    const vals = [rec.updatedAt, rec.createdAt, rec.syncedAt, rec._ftImportedAt]
+      .map(v => new Date(v || 0).getTime())
+      .filter(v => Number.isFinite(v) && v > 0);
+    return vals.length ? Math.max(...vals) : 0;
+  }
+
   function safeSettingsForCloud(settings) {
     const out = Object.assign({}, settings || {});
     [
@@ -213,18 +224,36 @@
     if (!st.customers) return { ok: false, error: '数据未就绪' };
     if (!SB.connected) return { ok: false, error: '未连接' };
     try {
+      const failedCustomers = [];
       for (const key of ['customers', 'aiHistory', 'marketAnalyses']) {
         const list = st[key] || [];
         for (const rec of list) {
           const id = rec.id || rec.bizId;
           if (!id) continue;
-          // syncedAt = "这条已成功同步到云端"的标记，必须随数据一起推上去，
-          // 否则 pull 回来时本地对象被云端记录替换、这个标记就丢了，
-          // 后面就无法区分「新建还没推」和「别处已删除」两种情况。
-          if (key === 'customers') rec.syncedAt = new Date().toISOString();
+          // 用户主动“上传到云端”本身就是一次明确的重新发布动作。
+          // 即使 JSON 里的 updatedAt/createdAt 很旧，也用 syncedAt 证明它是在最近一次清空之后重新发布的。
+          let syncStamp = '';
+          if (key === 'customers') {
+            syncStamp = new Date().toISOString();
+            rec.syncedAt = syncStamp;
+          }
           const r = await upsertRecord(key, id, rec);
-          if (r && !r.ok && key === 'customers') delete rec.syncedAt;  // 推送失败就不算同步过
+          if (key === 'customers') {
+            if (!r || r.ok !== true) {
+              delete rec.syncedAt;  // 推送失败就不算同步过
+              failedCustomers.push(id);
+            } else {
+              // 显式重新上传成功 = 允许该客户“复活/重建”。清掉本机同 ID 的旧墓碑和待删队列。
+              const tombAt = st.tombstones && st.tombstones[id];
+              if (tombAt && new Date(syncStamp).getTime() > new Date(tombAt || 0).getTime()) delete st.tombstones[id];
+              if (Array.isArray(st.pendingDeletes)) st.pendingDeletes = st.pendingDeletes.filter(x => x !== id);
+            }
+          }
         }
+      }
+      if (typeof window.__ftPersistState === 'function') { try { window.__ftPersistState(); } catch (e) {} }
+      if (failedCustomers.length) {
+        return { ok: false, error: `${failedCustomers.length} 个客户上传失败，请检查 Supabase 权限/网络后重试`, failed: failedCustomers };
       }
       if (st.calendar) {
         const calRec = Object.assign({ updatedAt: new Date().toISOString() }, st.calendar);
@@ -270,19 +299,20 @@
                   if (!c || !c.id) return;
                   // 全量清空是显式的全局操作：凡是在清空时间之前存在的本地客户都应删除，
                   // 不依赖旧版本是否带 syncedAt。只有清空之后真正新建/修改的记录才保留。
-                  const t = new Date(c.updatedAt || c.createdAt || c.syncedAt || 0).getTime();
+                  const t = customerClock(c);
                   if (!t || t <= ct + 1000) tombs[c.id] = clearMarker.clearedAt || clearMarker.updatedAt;
                 });
               }
             }
 
             // 墓碑判定：本地/云端已删掉的客户，旧记录不许复活
-            const isDead = (id, updatedAt) => {
+            const isDead = (id, rec) => {
               if (!id || !tombs[id]) return false;
               const t = new Date(tombs[id] || 0).getTime();
               if (!t) return false;
-              if (!updatedAt) return true;
-              return t >= new Date(updatedAt).getTime() - 1000;
+              const rt = (rec && typeof rec === 'object') ? customerClock(rec) : new Date(rec || 0).getTime();
+              if (!rt) return true;
+              return t >= rt - 1000;
             };
 
             // 兼容旧版本没有云端 tombstone 的删除：云端存在其他真实客户时，缺失的已同步客户视为远端删除。
@@ -301,14 +331,19 @@
             const localMap = new Map((st.customers || []).map(c => [c.id, c]));
             remoteCustomers.forEach(c => {
               if (!c.id) return;
-              if (isDead(c.id, c.updatedAt)) return;
+              if (isDead(c.id, c)) return;
               if (localMap.has(c.id)) {
                 const t1 = new Date(localMap.get(c.id).updatedAt || 0).getTime();
                 const t2 = new Date(c.updatedAt || 0).getTime();
                 localMap.set(c.id, t2 >= t1 ? c : localMap.get(c.id));
               } else localMap.set(c.id, c);
             });
-            st.customers = Array.from(localMap.values()).filter(c => !isDead(c.id, c.updatedAt));
+            // 若云端有一条比墓碑更新的记录，说明它被明确恢复/重新发布，撤掉旧墓碑。
+            remoteCustomers.forEach(c => {
+              if (c && c.id && tombs[c.id] && !isDead(c.id, c)) delete tombs[c.id];
+            });
+            st.customers = Array.from(localMap.values()).filter(c => !isDead(c.id, c));
+            if (typeof window.__ftPersistState === 'function') { try { window.__ftPersistState(); } catch (e) {} }
           } else {
             st[key] = res.records;
           }

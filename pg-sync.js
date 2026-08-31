@@ -47,6 +47,17 @@
 
   function status(msg, type) { if (PG.onStatus) { try { PG.onStatus(msg, type); } catch (e) {} } }
 
+
+  // 记录的“最近一次有效活动时间”。业务字段 updatedAt/createdAt 可能来自旧备份，
+  // 因此同步层还要考虑 syncedAt / _ftImportedAt，避免全量清空标记误杀刚重新导入的数据。
+  function customerClock(rec) {
+    if (!rec) return 0;
+    const vals = [rec.updatedAt, rec.createdAt, rec.syncedAt, rec._ftImportedAt]
+      .map(v => new Date(v || 0).getTime())
+      .filter(v => Number.isFinite(v) && v > 0);
+    return vals.length ? Math.max(...vals) : 0;
+  }
+
   function safeSettingsForCloud(settings) {
     const out = Object.assign({}, settings || {});
     [
@@ -200,12 +211,30 @@
     if (!st.customers) return { ok: false, error: '数据未就绪' };
     if (!PG.connected) return { ok: false, error: '未连接' };
     try {
+      const failedCustomers = [];
       for (const key of ['customers', 'aiHistory', 'marketAnalyses']) {
         const list = st[key] || [];
         for (const rec of list) {
           const id = rec.id || rec.bizId;
-          if (id) await upsertRecord(key, id, rec);
+          if (!id) continue;
+          let syncStamp = '';
+          if (key === 'customers') { syncStamp = new Date().toISOString(); rec.syncedAt = syncStamp; }
+          const r = await upsertRecord(key, id, rec);
+          if (key === 'customers') {
+            if (!r || r.ok !== true) {
+              delete rec.syncedAt;
+              failedCustomers.push(id);
+            } else {
+              const tombAt = st.tombstones && st.tombstones[id];
+              if (tombAt && new Date(syncStamp).getTime() > new Date(tombAt || 0).getTime()) delete st.tombstones[id];
+              if (Array.isArray(st.pendingDeletes)) st.pendingDeletes = st.pendingDeletes.filter(x => x !== id);
+            }
+          }
         }
+      }
+      if (typeof window.__ftPersistState === 'function') { try { window.__ftPersistState(); } catch (e) {} }
+      if (failedCustomers.length) {
+        return { ok: false, error: `${failedCustomers.length} 个客户上传失败，请检查云端权限/网络后重试`, failed: failedCustomers };
       }
       // 日历数据作为单条记录整体同步
       if (st.calendar) {
@@ -249,29 +278,34 @@
               if (ct) {
                 (st.customers || []).forEach(c => {
                   if (!c || !c.id) return;
-                  const t = new Date(c.updatedAt || c.createdAt || c.syncedAt || 0).getTime();
+                  const t = customerClock(c);
                   if (!t || t <= ct + 1000) tombs[c.id] = clearMarker.clearedAt || clearMarker.updatedAt;
                 });
               }
             }
-            const isDead = (id, updatedAt) => {
+            const isDead = (id, rec) => {
               if (!id || !tombs[id]) return false;
               const t = new Date(tombs[id] || 0).getTime();
               if (!t) return false;
-              if (!updatedAt) return true;
-              return t >= new Date(updatedAt).getTime() - 1000;
+              const rt = (rec && typeof rec === 'object') ? customerClock(rec) : new Date(rec || 0).getTime();
+              if (!rt) return true;
+              return t >= rt - 1000;
             };
             const localMap = new Map((st.customers || []).map(c => [c.id, c]));
             remoteCustomers.forEach(c => {
               if (!c.id) return;
-              if (isDead(c.id, c.updatedAt)) return;
+              if (isDead(c.id, c)) return;
               if (localMap.has(c.id)) {
                 const t1 = new Date(localMap.get(c.id).updatedAt || 0).getTime();
                 const t2 = new Date(c.updatedAt || 0).getTime();
                 localMap.set(c.id, t2 >= t1 ? c : localMap.get(c.id));
               } else localMap.set(c.id, c);
             });
-            st.customers = Array.from(localMap.values()).filter(c => !isDead(c.id, c.updatedAt));
+            remoteCustomers.forEach(c => {
+              if (c && c.id && tombs[c.id] && !isDead(c.id, c)) delete tombs[c.id];
+            });
+            st.customers = Array.from(localMap.values()).filter(c => !isDead(c.id, c));
+            if (typeof window.__ftPersistState === 'function') { try { window.__ftPersistState(); } catch (e) {} }
           } else {
             st[key] = res.records;
           }

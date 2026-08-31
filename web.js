@@ -3749,10 +3749,20 @@ function renderSettings() {
     const d = r.data || {};
     if (!Array.isArray(d.customers)) { toast('格式错误', '文件不包含 customers 数组', 'err'); return; }
     if (!confirm(`将导入 ${d.customers.length} 个客户，覆盖当前数据，确定继续？`)) return;
-    state.customers = d.customers;
+    // “导入 JSON”是用户明确的新数据集。旧文件里的 updatedAt/createdAt 可能早于最近一次全量清空，
+    // 所以给本次导入加独立时间戳，并撤销同 ID 的旧墓碑/待删项，避免上传后被 clear marker 误判为旧数据。
+    const importStamp = nowISO();
+    const imported = d.customers.map(c => Object.assign({}, c, { _ftImportedAt: importStamp }));
+    const importedIds = new Set(imported.map(c => c && c.id).filter(Boolean));
+    importedIds.forEach(id => {
+      if (state.tombstones) delete state.tombstones[id];
+      if (state.trash) delete state.trash[id];
+    });
+    state.pendingDeletes = (state.pendingDeletes || []).filter(id => !importedIds.has(id));
+    state.customers = imported;
     state.aiHistory = Array.isArray(d.aiHistory) ? d.aiHistory : [];
     state.marketAnalyses = Array.isArray(d.marketAnalyses) ? d.marketAnalyses : [];
-    persistAll(); toast('导入完成', `${state.customers.length} 个客户`, 'ok'); render();
+    persistAll(); toast('导入完成', `${state.customers.length} 个客户，可安全重新上传云端`, 'ok'); render();
   });
 
   const trashBtn = $('#st-trash');
@@ -4043,6 +4053,7 @@ async function init() {
 
   // 暴露给 CloudBase 实时同步模块
   window.__ftState = state;
+  window.__ftPersistState = persistAll;
   // 注册配置同步回调：从云端拉到新配置时，应用公司画像/API Key/连接配置
   if (window.__ftCloud && window.__ftCloud.onSettings) {
     window.__ftCloud.onSettings((remoteCfg) => applyCloudSettings(remoteCfg));
