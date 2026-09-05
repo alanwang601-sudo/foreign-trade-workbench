@@ -1,11 +1,14 @@
 /* 外贸工作台 Web 版 Service Worker
  * 提供离线缓存，让"添加到主屏幕"的 App 在无网络时也能打开 */
-const CACHE = 'ftw-cache-v15-json-append';
+const CACHE = 'ftw-cache-v16-workbench-v4';
 const ASSETS = [
   './',
   './index.html',
   './web.js',
   './styles.css',
+  './v4-workbench.css',
+  './v4-workbench.js',
+  './products-seed.json',
   './manifest.json',
   './icon-192.png',
   './icon-512.png',

@@ -880,13 +880,13 @@ function drawLine(canvas, labels, values, color) {
 // 渲染路由
 // =========================================================
 let main, pageTitleEl;
-const VIEW_TITLE = { dashboard: '工作台', lead: '智能开发', research: '深度背调', market: '市场分析', crm: '客户管理', calendar: '日历', settings: '设置' };
+const VIEW_TITLE = { dashboard: '工作台', lead: '智能开发', research: '深度背调', market: '市场分析', crm: '客户管理', review: '审核中心', products: '产品中心', workflows: '市场开发SOP', intelligence: '客户情报日报', calendar: '日历', settings: '设置' };
 
 function render() {
   // 高亮导航
   $all('.nav-item').forEach(a => a.classList.toggle('active', a.dataset.view === state.view));
   pageTitleEl.textContent = VIEW_TITLE[state.view] || '工作台';
-  const map = { dashboard: renderDashboard, lead: renderLead, research: renderResearch, market: renderMarket, crm: renderCrm, calendar: renderCalendar, settings: renderSettings };
+  const map = { dashboard: renderDashboard, lead: renderLead, research: renderResearch, market: renderMarket, crm: renderCrm, review: renderReviewCenter, products: renderProductsCenter, workflows: renderWorkflowsCenter, intelligence: renderIntelligenceCenter, calendar: renderCalendar, settings: renderSettings };
   (map[state.view] || renderDashboard)();
   // 仅在切换视图或首次渲染时重置滚动；同步刷新（__ftRefreshUI）时保留滚动位置
   if (!state._skipScrollReset) {
@@ -3792,7 +3792,7 @@ function renderSettings() {
   });
 
   $('#st-export').addEventListener('click', async () => {
-    const data = { customers: state.customers, aiHistory: state.aiHistory, marketAnalyses: state.marketAnalyses, exportedAt: nowISO() };
+    const data = { customers: state.customers, aiHistory: state.aiHistory, marketAnalyses: state.marketAnalyses, calendar: state.calendar, v4Workspace: (window.__ftV4 || null), exportedAt: nowISO(), _v: 4 };
     const r = await exportDataWeb(data);
     if (r.ok) toast('已导出', r.filePath, 'ok');
     else if (!r.canceled) toast('导出失败', r.error || '', 'err');
@@ -3803,6 +3803,7 @@ function renderSettings() {
     if (!r.ok) { if (!r.canceled) toast('导入失败', r.error || '', 'err'); return; }
     const d = r.data || {};
     if (!Array.isArray(d.customers)) { toast('格式错误', '文件不包含 customers 数组', 'err'); return; }
+    if (d.v4Workspace && window.__ftLoadV4) window.__ftLoadV4(d.v4Workspace);
     const beforeCount = state.customers.length;
     if (!confirm(`将新增导入 ${d.customers.length} 个客户。\n当前已有 ${beforeCount} 个客户，原有客户不会被清空。\n若检测到同一公司，将智能合并而不是重复创建。\n\n确定继续？`)) return;
 
