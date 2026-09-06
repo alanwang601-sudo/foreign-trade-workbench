@@ -10,6 +10,8 @@
   <title>外贸工作台 · Web版</title>
   <link rel="stylesheet" href="styles.css" />
   <link rel="stylesheet" href="v4-workbench.css" />
+  <link rel="stylesheet" href="v5-workbench.css" />
+  <link rel="stylesheet" href="v6-workbench.css" />
 </head>
 <body>
   <div id="app">
@@ -30,8 +32,16 @@
         <a class="nav-item" data-view="crm"><span class="nav-ico">👥</span>客户管理</a>
         <a class="nav-item" data-view="review"><span class="nav-ico">✓</span>审核中心</a>
         <a class="nav-item" data-view="products"><span class="nav-ico">▣</span>产品中心</a>
+        <a class="nav-item" data-view="communications"><span class="nav-ico">✉</span>沟通时间线</a>
+        <a class="nav-item" data-view="analytics"><span class="nav-ico">◉</span>营销效果</a>
+        <a class="nav-item" data-view="insights"><span class="nav-ico">◆</span>营销洞察</a>
+        <a class="nav-item" data-view="emailcenter"><span class="nav-ico">✎</span>开发邮件中心</a>
+        <a class="nav-item" data-view="opportunities"><span class="nav-ico">◇</span>商机项目</a>
+        <a class="nav-item" data-view="orders"><span class="nav-ico">▤</span>订单管理</a>
+        <a class="nav-item" data-view="templates"><span class="nav-ico">文</span>邮件素材库</a>
         <a class="nav-item" data-view="workflows"><span class="nav-ico">⇢</span>市场SOP</a>
         <a class="nav-item" data-view="intelligence"><span class="nav-ico">◫</span>情报日报</a>
+        <a class="nav-item" data-view="auditlog"><span class="nav-ico">≡</span>操作日志</a>
         <a class="nav-item" data-view="calendar"><span class="nav-ico">📅</span>日历</a>
         <a class="nav-item" data-view="settings"><span class="nav-ico">⚙</span>设置</a>
       </nav>
@@ -63,6 +73,8 @@
   <!-- Web 版本：引用 web.js（纯前端，无需 Electron） -->
   <script src="web.js" defer></script>
   <script src="v4-workbench.js" defer></script>
+  <script src="v5-workbench.js" defer></script>
+  <script src="v6-workbench.js" defer></script>
   <!-- 实时同步模块：Supabase(推荐) + CloudBase NoSQL + 注入补丁（在 web.js 之后加载） -->
   <script src="sb-sync.js" defer></script>
   <script src="pg-sync.js" defer></script>

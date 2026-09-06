@@ -880,13 +880,13 @@ function drawLine(canvas, labels, values, color) {
 // 渲染路由
 // =========================================================
 let main, pageTitleEl;
-const VIEW_TITLE = { dashboard: '工作台', lead: '智能开发', research: '深度背调', market: '市场分析', crm: '客户管理', review: '审核中心', products: '产品中心', workflows: '市场开发SOP', intelligence: '客户情报日报', calendar: '日历', settings: '设置' };
+const VIEW_TITLE = { dashboard: '工作台', lead: '智能开发', research: '深度背调', market: '市场分析', crm: '客户管理', review: '审核中心', products: '产品中心', communications: '统一沟通时间线', analytics: '营销效果分析', insights: '营销洞察与关键动作评分', emailcenter: '开发邮件中心', opportunities: '商机项目管理', orders: '订单管理', templates: '多语言邮件素材库', workflows: '市场开发SOP', intelligence: '客户情报日报', auditlog: '操作日志', calendar: '日历', settings: '设置' };
 
 function render() {
   // 高亮导航
   $all('.nav-item').forEach(a => a.classList.toggle('active', a.dataset.view === state.view));
   pageTitleEl.textContent = VIEW_TITLE[state.view] || '工作台';
-  const map = { dashboard: renderDashboard, lead: renderLead, research: renderResearch, market: renderMarket, crm: renderCrm, review: renderReviewCenter, products: renderProductsCenter, workflows: renderWorkflowsCenter, intelligence: renderIntelligenceCenter, calendar: renderCalendar, settings: renderSettings };
+  const map = { dashboard: renderDashboard, lead: renderLead, research: renderResearch, market: renderMarket, crm: renderCrm, review: renderReviewCenter, products: renderProductsCenter, communications: renderCommunicationsCenter, analytics: renderMarketingAnalytics, insights: renderMarketingInsights, emailcenter: renderEmailCenter, opportunities: renderOpportunitiesCenter, orders: renderOrdersCenter, templates: renderTemplatesCenter, workflows: renderWorkflowsCenter, intelligence: renderIntelligenceCenter, auditlog: renderAuditLog, calendar: renderCalendar, settings: renderSettings };
   (map[state.view] || renderDashboard)();
   // 仅在切换视图或首次渲染时重置滚动；同步刷新（__ftRefreshUI）时保留滚动位置
   if (!state._skipScrollReset) {
