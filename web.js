@@ -3564,7 +3564,7 @@ function applyCloudSettings(remoteCfg) {
       }
     }
     // 刷新当前展示页（dash/crm/calendar），让画像/连接状态生效
-    if (state.view === 'dashboard' || state.view === 'crm' || state.view === 'calendar' || state.view === 'settings') {
+    if (!state._manualCloudPull && (state.view === 'dashboard' || state.view === 'crm' || state.view === 'calendar')) {
       state._skipScrollReset = true;
       render();
     }
@@ -3696,12 +3696,12 @@ function renderSettings() {
       <div class="field"><label>Project URL <span class="small muted">（如 https://xxxx.supabase.co）</span></label><input id="sb-url" type="text" value="${esc(window.__ftSupabaseCloud ? window.__ftSupabaseCloud.getConfig().url : '')}" placeholder="https://xxxx.supabase.co"></div>
       <div class="field"><label>anon public key <span class="small muted">（Project Settings → API → anon public）</span></label><input id="sb-key" type="text" value="${esc(window.__ftSupabaseCloud ? window.__ftSupabaseCloud.getConfig().key : '')}" placeholder="eyJhbGciOiJ..."></div>
       <div class="flex gap8 wrap mt8" style="margin-top:12px">
-        <button class="btn primary" id="sb-connect">🔗 连接 Supabase</button>
-        <button class="btn" id="sb-push">☝️ 上传到云端</button>
-        <button class="btn" id="sb-pull">👇 从云端拉取</button>
-        <button class="btn" id="sb-health">🩺 健康检查</button>
-        <button class="btn" id="sb-restore-snapshot">↩️ 恢复安全快照</button>
-        <button class="btn" id="sb-disconnect">断开</button>
+        <button type="button" class="btn primary" id="sb-connect">🔗 连接 Supabase</button>
+        <button type="button" class="btn" id="sb-push">☝️ 上传到云端</button>
+        <button type="button" class="btn" id="sb-pull">👇 从云端拉取</button>
+        <button type="button" class="btn" id="sb-health">🩺 健康检查</button>
+        <button type="button" class="btn" id="sb-restore-snapshot">↩️ 恢复安全快照</button>
+        <button type="button" class="btn" id="sb-disconnect">断开</button>
       </div>
       <div id="sb-msg" class="help" style="margin-top:10px"></div>
       <div id="sb-status" class="help" style="margin-top:6px;color:var(--muted)">未连接</div>
@@ -3713,10 +3713,10 @@ function renderSettings() {
       <div class="field"><label>CloudBase 环境 ID</label><input id="st-cb-env" type="text" value="${esc(window.__ftCloud ? window.__ftCloud.getConfig().envId : '')}" placeholder="如 your-app-xxxx"></div>
       <div class="field"><label>地域 <span class="small muted">（默认上海 ap-shanghai）</span></label><input id="st-cb-region" type="text" value="${esc(window.__ftCloud ? window.__ftCloud.getConfig().region : 'ap-shanghai')}" placeholder="ap-shanghai"></div>
       <div class="flex gap8 wrap mt8" style="margin-top:12px">
-        <button class="btn primary" id="st-cb-connect">🔗 连接云端</button>
-        <button class="btn" id="st-cb-push">☝️ 上传到云端</button>
-        <button class="btn" id="st-cb-pull">👇 从云端拉取</button>
-        <button class="btn" id="st-cb-disconnect">断开</button>
+        <button type="button" class="btn primary" id="st-cb-connect">🔗 连接云端</button>
+        <button type="button" class="btn" id="st-cb-push">☝️ 上传到云端</button>
+        <button type="button" class="btn" id="st-cb-pull">👇 从云端拉取</button>
+        <button type="button" class="btn" id="st-cb-disconnect">断开</button>
       </div>
       <div id="st-cb-msg" class="help" style="margin-top:10px"></div>
       <div id="st-cb-status" class="help" style="margin-top:6px;color:var(--muted)">未连接</div>
@@ -4112,15 +4112,24 @@ function renderSettings() {
   });
   // 拉取
   const cbPull = $('#st-cb-pull');
-  if (cbPull) cbPull.addEventListener('click', async () => {
+  if (cbPull) cbPull.addEventListener('click', async (e) => {
+    e.preventDefault(); e.stopPropagation();
     if (!window.__ftCloud) return;
+    const scroller = $('#main') || document.getElementById('main');
+    const keepTop = scroller ? scroller.scrollTop : 0;
+    const keepWinY = window.scrollY || document.documentElement.scrollTop || 0;
+    state._manualCloudPull = true;
     cbMsgEl().innerHTML = '<span style="color:var(--muted)">⏳ 正在拉取…</span>';
-    const r = await window.__ftCloud.pullAll();
-    cbMsgEl().innerHTML = r.ok ? '<span style="color:var(--success)">✓ 已从云端拉取 ' + (r.count||0) + ' 个客户并合并</span>' : '<span style="color:var(--danger)">✗ ' + esc(r.error) + '</span>';
-    // V6.1.1：设置页拉取成功后不再整页 render()。
-    // 数据已写入 state/localStorage，切换到 CRM/日历时会自然显示最新数据；
-    // 避免设置页滚动位置被重置，看起来像“页面刷新/跳页”。
-    if (r.ok) { updateCloudHealthBadge(); }
+    let r;
+    try { r = await window.__ftCloud.pullAll(); }
+    finally { state._manualCloudPull = false; }
+    cbMsgEl().innerHTML = r && r.ok ? '<span style="color:var(--success)">✓ 已从云端拉取 ' + (r.count||0) + ' 个客户并合并</span>' : '<span style="color:var(--danger)">✗ ' + esc((r&&r.error)||'拉取失败') + '</span>';
+    if (r && r.ok) updateCloudHealthBadge();
+    requestAnimationFrame(() => {
+      if (scroller) scroller.scrollTop = keepTop;
+      window.scrollTo(0, keepWinY);
+      requestAnimationFrame(() => { if (scroller) scroller.scrollTop = keepTop; window.scrollTo(0, keepWinY); });
+    });
   });
   // 断开
   const cbDisc = $('#st-cb-disconnect');
@@ -4175,18 +4184,28 @@ function renderSettings() {
     sbMsgEl().innerHTML = r.ok ? '<span style="color:var(--success)">✓ 已上传到云端</span>' : '<span style="color:var(--danger)">✗ ' + esc(r.error) + '</span>';
   });
   const sbPull = $('#sb-pull');
-  if (sbPull) sbPull.addEventListener('click', async () => {
+  if (sbPull) sbPull.addEventListener('click', async (e) => {
+    e.preventDefault(); e.stopPropagation();
     if (!window.__ftSupabaseCloud) return;
+    const scroller = $('#main') || document.getElementById('main');
+    const keepTop = scroller ? scroller.scrollTop : 0;
+    const keepWinY = window.scrollY || document.documentElement.scrollTop || 0;
+    state._manualCloudPull = true;
     sbMsgEl().innerHTML = '<span style="color:var(--muted)">⏳ 正在拉取…</span>';
-    const r = await window.__ftSupabaseCloud.pullAll();
-    sbMsgEl().innerHTML = r.ok ? '<span style="color:var(--success)">✓ 已从云端拉取 ' + (r.count||0) + ' 个客户并合并</span>' : '<span style="color:var(--danger)">✗ ' + esc(r.error) + '</span>';
-    // V6.1.1：不要在设置页手动拉取后整页重绘。
-    // pullAll 已完成数据合并和持久化；页面重绘只会导致滚动条跳回顶部。
-    if (r.ok) {
+    let r;
+    try { r = await window.__ftSupabaseCloud.pullAll(); }
+    finally { state._manualCloudPull = false; }
+    sbMsgEl().innerHTML = r && r.ok ? '<span style="color:var(--success)">✓ 已从云端拉取 ' + (r.count||0) + ' 个客户并合并</span>' : '<span style="color:var(--danger)">✗ ' + esc((r&&r.error)||'拉取失败') + '</span>';
+    if (r && r.ok) {
       const st = window.__ftSupabaseCloud.getState();
       sbUiStatus(`✅ 已连接 · 上次同步：${st.lastSync || '刚刚'}`, 'ok');
       updateCloudHealthBadge();
     }
+    requestAnimationFrame(() => {
+      if (scroller) scroller.scrollTop = keepTop;
+      window.scrollTo(0, keepWinY);
+      requestAnimationFrame(() => { if (scroller) scroller.scrollTop = keepTop; window.scrollTo(0, keepWinY); });
+    });
   });
   const sbHealth = $('#sb-health');
   if (sbHealth) sbHealth.addEventListener('click', async () => {
