@@ -498,3 +498,11 @@ canvas.chart { width: 100%; display: block; }
   .cal-hol { display: none; }
   .cal-dots { font-size: 9.5px; }
 }
+
+
+/* V6.1 云端健康状态 */
+.cloud-health-badge{display:inline-flex;align-items:center;gap:5px;padding:5px 9px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap;background:var(--surface-2,#eef2ff);color:var(--muted,#64748b);border:1px solid var(--border,#e2e8f0)}
+.cloud-health-badge.ok{background:rgba(22,163,74,.10);color:var(--success,#16a34a);border-color:rgba(22,163,74,.28)}
+.cloud-health-badge.err{background:rgba(220,38,38,.10);color:var(--danger,#dc2626);border-color:rgba(220,38,38,.28)}
+.cloud-health-badge.warn{background:rgba(217,119,6,.10);color:#b45309;border-color:rgba(217,119,6,.28)}
+@media(max-width:760px){.cloud-health-badge{font-size:11px;padding:4px 7px}.cloud-health-badge .cloud-extra{display:none}}

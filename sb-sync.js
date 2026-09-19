@@ -26,7 +26,10 @@
     lastError: '',
     pollTimer: null,
     lastFingerprint: '',
-    onStatus: null
+    onStatus: null,
+    lastOkAt: '',
+    failureCount: 0,
+    lastReconnectAttempt: 0
   };
 
   // 业务 key -> 表名
@@ -45,6 +48,30 @@
 
   function status(msg, type) { if (SB.onStatus) { try { SB.onStatus(msg, type); } catch (e) {} } }
   function getState() { return window.__ftState || {}; }
+
+  function noteSuccess() {
+    SB.connected = true;
+    SB.failureCount = 0;
+    SB.lastError = '';
+    SB.lastOkAt = new Date().toISOString();
+  }
+  function noteFailure(msg) {
+    SB.failureCount = (SB.failureCount || 0) + 1;
+    SB.lastError = msg || '云端请求失败';
+    if (SB.failureCount >= 3) SB.connected = false;
+  }
+  function friendlyNetworkError(e) {
+    const raw = (e && e.message) ? e.message : String(e || '连接失败');
+    if (/Failed to fetch|NetworkError|Load failed/i.test(raw)) return '无法访问 Supabase 项目：可能已暂停、项目已删除，或当前网络不可达';
+    return raw;
+  }
+  async function fetchTimeout(url, options, ms) {
+    const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), ms || 15000) : null;
+    try {
+      return await fetch(url, Object.assign({}, options || {}, ctrl ? { signal: ctrl.signal } : {}));
+    } finally { if (timer) clearTimeout(timer); }
+  }
 
 
   // 记录的“最近一次有效活动时间”。业务字段 updatedAt/createdAt 可能来自旧备份，
@@ -80,34 +107,15 @@
     if (url) SB.url = url.trim().replace(/\/+$/, '');
     if (key) SB.key = key.trim();
     if (!SB.url || !SB.key) return { ok: false, error: '未配置 Supabase URL 或密钥' };
-    // 简易超时包装：15 秒没返回就当作网络/防火墙问题
-    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('连接超时（15s），请检查网络或 Supabase URL 是否正确')), 15000));
     try {
-      // 用一次轻量请求验证连通性 + 权限（查 customers 表，最多 1 行）
-      // 注意：新版 Supabase key（sb_publishable/sb_secret）只能放 apikey header，
-      //      不能放 Authorization: Bearer（会被当成 JWT 解析报 Invalid JWT）
-      const fetchP = fetch(`${SB.url}/rest/v1/customers?select=id&limit=1`, {
-        headers: { apikey: SB.key, 'Content-Type': 'application/json' }
-      });
-      const r = await Promise.race([fetchP, timeout]);
-      if (!r.ok) {
-        const body = await r.text().catch(() => '');
-        let msg = `HTTP ${r.status}`;
-        if (r.status === 401 || r.status === 403) msg = '密钥无效或无权限（请确认 anon key 正确）';
-        else if (r.status === 404) msg = '表不存在，请先在 Supabase SQL Editor 运行建表 SQL';
-        else if (r.status === 0 || r.status === 502 || r.status === 503) msg = 'Supabase 不可达（' + r.status + '），请检查 URL 或网络';
-        else if (body && body.length < 200) msg += ': ' + body;
-        SB.lastError = msg; status(msg, 'err');
-        return { ok: false, error: msg };
-      }
-      SB.connected = true;
-      SB.lastError = '';
+      const r = await healthCheck(true);
+      if (!r.ok) return r;
+      noteSuccess();
       status('已连接（Supabase）', 'ok');
       return { ok: true };
     } catch (e) {
-      SB.connected = false;
-      const msg = e.message || '连接失败';
-      SB.lastError = msg;
+      const msg = friendlyNetworkError(e);
+      noteFailure(msg);
       status(msg, 'err');
       return { ok: false, error: msg };
     }
@@ -116,6 +124,43 @@
   // ---------- REST 封装 ----------
   // 新版 Supabase key 只能放 apikey header（不能放 Authorization Bearer，会被当 JWT 拒绝）
   function hdrs() { return { 'apikey': SB.key, 'Content-Type': 'application/json' }; }
+
+  // 健康检查优先访问 health_check；旧项目没有该表时回退 customers。
+  async function healthCheck(silent) {
+    if (!SB.url || !SB.key) return { ok: false, error: '未配置 Supabase URL 或密钥' };
+    const paths = ['health_check?select=id&limit=1', 'customers?select=id&limit=1'];
+    let last = '';
+    for (const path of paths) {
+      try {
+        const r = await fetchTimeout(`${SB.url}/rest/v1/${path}`, { headers: hdrs() }, 15000);
+        if (r.ok) { noteSuccess(); if (!silent) status('云端健康检查正常', 'ok'); return { ok: true, lastOkAt: SB.lastOkAt }; }
+        const body = await r.text().catch(() => '');
+        if (r.status === 404) { last = '表不存在'; continue; }
+        if (r.status === 401 || r.status === 403) last = '密钥无效或无权限';
+        else if (r.status === 502 || r.status === 503) last = `Supabase 暂不可达（HTTP ${r.status}）`;
+        else last = `HTTP ${r.status}${body && body.length < 120 ? ': ' + body : ''}`;
+        break;
+      } catch (e) { last = friendlyNetworkError(e); break; }
+    }
+    const msg = last || 'Supabase 健康检查失败';
+    noteFailure(msg);
+    if (!silent) status(msg, 'err');
+    return { ok: false, error: msg, failures: SB.failureCount };
+  }
+
+  function mergeRecordsById(localList, remoteList) {
+    const map = new Map();
+    (Array.isArray(localList) ? localList : []).forEach(r => { if (r && r.id) map.set(r.id, r); });
+    (Array.isArray(remoteList) ? remoteList : []).forEach(r => {
+      if (!r || !r.id) return;
+      const cur = map.get(r.id);
+      if (!cur) { map.set(r.id, r); return; }
+      const lt = new Date(cur.updatedAt || cur.createdAt || 0).getTime();
+      const rt = new Date(r.updatedAt || r.createdAt || 0).getTime();
+      map.set(r.id, rt >= lt ? r : cur);
+    });
+    return Array.from(map.values());
+  }
 
   // ---------- upsert 一条记录 ----------
   async function upsertRecord(key, id, doc) {
@@ -149,8 +194,9 @@
     const table = TABLES[key];
     if (!table) return { ok: false, error: '未知表' };
     try {
-      const r = await fetch(`${SB.url}/rest/v1/${table}?select=id,data,updated_at`, { headers: hdrs() });
-      if (!r.ok) return { ok: false, error: `HTTP ${r.status}` };
+      const r = await fetchTimeout(`${SB.url}/rest/v1/${table}?select=id,data,updated_at`, { headers: hdrs() }, 15000);
+      if (!r.ok) { const msg = `HTTP ${r.status}`; noteFailure(msg); return { ok: false, error: msg }; }
+      noteSuccess();
       const rows = await r.json();
       const records = (Array.isArray(rows) ? rows : []).map(row => {
         let obj = {};
@@ -159,7 +205,7 @@
       });
       return { ok: true, records };
     } catch (e) {
-      return { ok: false, error: e.message || '拉取失败' };
+      const msg = friendlyNetworkError(e); noteFailure(msg); return { ok: false, error: msg || '拉取失败' };
     }
   }
 
@@ -221,6 +267,7 @@
   // ---------- 全量推送 ----------
   async function fullPush() {
     const st = getState();
+    if (typeof window.__ftCreateSafetySnapshot === 'function') { try { window.__ftCreateSafetySnapshot('before_supabase_push'); } catch (e) {} }
     if (!st.customers) return { ok: false, error: '数据未就绪' };
     if (!SB.connected) return { ok: false, error: '未连接' };
     try {
@@ -253,23 +300,22 @@
       }
       if (typeof window.__ftPersistState === 'function') { try { window.__ftPersistState(); } catch (e) {} }
       if (failedCustomers.length) {
-        return { ok: false, error: `${failedCustomers.length} 个客户上传失败，请检查 Supabase 权限/网络后重试`, failed: failedCustomers };
+        const msg = `${failedCustomers.length} 个客户上传失败，请检查 Supabase 权限/网络后重试`; noteFailure(msg); return { ok: false, error: msg, failed: failedCustomers };
       }
       if (st.calendar) {
         const calRec = Object.assign({ updatedAt: new Date().toISOString() }, st.calendar);
-        await upsertRecord('calendar', 'ftw_calendar', calRec);
+        const cr = await upsertRecord('calendar', 'ftw_calendar', calRec); if (!cr.ok) throw new Error('日历上传失败：' + (cr.error || '未知错误'));
       }
       if (st.settings) {
         const setRec = Object.assign({ updatedAt: new Date().toISOString() }, safeSettingsForCloud(st.settings));
-        await upsertRecord('settings', 'ftw_settings', setRec);
+        const sr = await upsertRecord('settings', 'ftw_settings', setRec); if (!sr.ok) throw new Error('设置上传失败：' + (sr.error || '未知错误'));
       }
       SB.lastSync = new Date().toLocaleString('zh-CN');
-      SB.lastError = '';
+      noteSuccess();
       status('已上传 ' + (st.customers || []).length + ' 个客户', 'ok');
       return { ok: true };
     } catch (e) {
-      SB.lastError = e.message || '同步失败';
-      return { ok: false, error: SB.lastError };
+      const msg = friendlyNetworkError(e) || '同步失败'; noteFailure(msg); return { ok: false, error: msg };
     }
   }
 
@@ -277,10 +323,12 @@
   async function pullAndMerge() {
     if (!SB.connected) return { ok: false, error: '未连接' };
     const st = getState();
+    if (typeof window.__ftCreateSafetySnapshot === 'function') { try { window.__ftCreateSafetySnapshot('before_supabase_pull'); } catch (e) {} }
     try {
       for (const key of ['customers', 'aiHistory', 'marketAnalyses']) {
         const res = await pullTable(key);
-        if (res.ok && Array.isArray(res.records)) {
+        if (!res.ok) throw new Error(`${key} 拉取失败：${res.error || '未知错误'}`);
+        if (Array.isArray(res.records)) {
           if (key === 'customers') {
             const tombs = st.tombstones || {};
             const allRemote = res.records || [];
@@ -345,12 +393,13 @@
             st.customers = Array.from(localMap.values()).filter(c => !isDead(c.id, c));
             if (typeof window.__ftPersistState === 'function') { try { window.__ftPersistState(); } catch (e) {} }
           } else {
-            st[key] = res.records;
+            st[key] = mergeRecordsById(st[key] || [], res.records || []);
           }
         }
       }
       const calRes = await pullTable('calendar');
-      if (calRes.ok && Array.isArray(calRes.records) && calRes.records.length) {
+      if (!calRes.ok) throw new Error('calendar 拉取失败：' + (calRes.error || '未知错误'));
+      if (Array.isArray(calRes.records) && calRes.records.length) {
         const calRec = calRes.records.find(r => r.id === 'ftw_calendar');
         if (calRec) {
           const local = st.calendar || { todos: [], customHolidays: [] };
@@ -387,7 +436,8 @@
         }
       }
       const setRes = await pullTable('settings');
-      if (setRes.ok && Array.isArray(setRes.records) && setRes.records.length) {
+      if (!setRes.ok) throw new Error('settings 拉取失败：' + (setRes.error || '未知错误'));
+      if (Array.isArray(setRes.records) && setRes.records.length) {
         const setRec = setRes.records.find(r => r.id === 'ftw_settings');
         if (setRec) {
           const t1 = new Date((st.settings && st.settings.__syncedAt) || 0).getTime();
@@ -401,11 +451,10 @@
         }
       }
       SB.lastSync = new Date().toLocaleString('zh-CN');
-      SB.lastError = '';
+      noteSuccess();
       return { ok: true, count: st.customers.length };
     } catch (e) {
-      SB.lastError = e.message || '拉取失败';
-      return { ok: false, error: SB.lastError };
+      const msg = friendlyNetworkError(e) || '拉取失败'; noteFailure(msg); return { ok: false, error: msg };
     }
   }
 
@@ -431,15 +480,22 @@
   function startPolling(interval) {
     if (SB.pollTimer) return;
     SB.lastFingerprint = fingerprint();
-    const ms = interval || 12000;
+    const ms = interval || 30000;
     SB.pollTimer = setInterval(async () => {
-      if (!SB.connected) return;
+      if (!SB.connected) {
+        if (SB.url && SB.key && Date.now() - (SB.lastReconnectAttempt || 0) > 60000) {
+          SB.lastReconnectAttempt = Date.now();
+          try { await connect(SB.url, SB.key); } catch (e) {}
+        }
+        return;
+      }
       if (isBusy()) return;
       // 补推离线期间删掉的客户（断网时删除没能通知云端，联网后在这里补删）
       if (window.__ftFlushDeletes) { try { await window.__ftFlushDeletes(); } catch (e) {} }
       const cur = fingerprint();
       if (cur !== SB.lastFingerprint) { SB.lastFingerprint = cur; try { await fullPush(); } catch (e) {} }
       const r = await pullAndMerge();
+      if (!r.ok) { status(r.error || '云端同步失败，本地数据已保留', 'err'); return; }
       if (r.ok) {
         const cur2 = fingerprint();
         if (cur2 !== SB.lastFingerprint) SB.lastFingerprint = cur2;
@@ -451,10 +507,10 @@
   function disconnect() { stopPolling(); SB.connected = false; }
 
   window.__ftSupabase = {
-    connect, disconnect, fullPush, pullAndMerge, startPolling, stopPolling,
+    connect, disconnect, fullPush, pullAndMerge, startPolling, stopPolling, healthCheck,
     pullTable, upsertRecord, deleteRecord, deleteAllRecords, clearBusinessData,
     saveConfig, getConfig,
-    getState: () => ({ connected: SB.connected, lastSync: SB.lastSync, lastError: SB.lastError }),
+    getState: () => ({ connected: SB.connected, lastSync: SB.lastSync, lastError: SB.lastError, lastOkAt: SB.lastOkAt, failureCount: SB.failureCount }),
     onStatus: (fn) => { SB.onStatus = fn; },
     onSettings: (fn) => { SB.onSettings = fn; }
   };

@@ -15,6 +15,8 @@ const LS = {
   trash: 'ftw_trash',           // 回收站：{ 客户id: { deletedAt, snapshot } }，30 天内可恢复
   pendingDeletes: 'ftw_pending_deletes' // 离线删除待补推队列，必须跨刷新持久化
 };
+const SAFETY_BACKUP_KEY = 'ftw_safety_backup_v61';
+const V61_MIGRATION_KEY = 'ftw_v61_notes_repaired';
 // 墓碑 / 回收站保留时长（毫秒）：30 天后自动清除，避免无限增长
 const TOMBSTONE_TTL = 30 * 24 * 3600 * 1000;
 // 回收站最多保留条数（防止 localStorage 被撑爆）
@@ -143,6 +145,74 @@ function persistAll() {
   if (state.pendingDeletes && state.pendingDeletes.length) saveLS(LS.pendingDeletes, Array.from(new Set(state.pendingDeletes)));
   else { try { localStorage.removeItem(LS.pendingDeletes); } catch (e) {} }
 }
+
+function buildBackupPayload() {
+  return {
+    customers: state.customers || [],
+    aiHistory: state.aiHistory || [],
+    marketAnalyses: state.marketAnalyses || [],
+    calendar: state.calendar || { todos: [], customHolidays: [] },
+    v4Workspace: (window.__ftV4 || null),
+    exportedAt: nowISO(),
+    _v: 6.1
+  };
+}
+function createSafetySnapshot(reason) {
+  try {
+    const why = reason || 'manual';
+    const prevRaw = localStorage.getItem(SAFETY_BACKUP_KEY);
+    if (/^before_supabase_/.test(why) && prevRaw) {
+      try {
+        const prev = JSON.parse(prevRaw);
+        const pt = new Date(prev?._safety?.at || 0).getTime();
+        // 轮询会频繁拉取；自动安全快照最多每 10 分钟写一次，避免反复写 localStorage。
+        if (pt && Date.now() - pt < 10 * 60 * 1000) return { ok: true, at: prev._safety.at, skipped: true };
+      } catch (e) {}
+    }
+    const payload = buildBackupPayload();
+    payload._safety = { reason: why, at: nowISO() };
+    localStorage.setItem(SAFETY_BACKUP_KEY, JSON.stringify(payload));
+    return { ok: true, at: payload._safety.at };
+  } catch (e) { return { ok: false, error: e.message || '安全快照失败' }; }
+}
+function restoreSafetySnapshot() {
+  try {
+    const raw = localStorage.getItem(SAFETY_BACKUP_KEY);
+    if (!raw) return { ok: false, error: '暂无安全快照' };
+    const d = JSON.parse(raw);
+    if (!Array.isArray(d.customers)) return { ok: false, error: '安全快照格式异常' };
+    if (!confirm(`将恢复最近安全快照（${(d._safety && d._safety.at) || '未知时间'}）。\n当前本地数据会被替换，但不会修改云端。确定继续？`)) return { ok: false, canceled: true };
+    state.customers = d.customers || [];
+    state.aiHistory = Array.isArray(d.aiHistory) ? d.aiHistory : [];
+    state.marketAnalyses = Array.isArray(d.marketAnalyses) ? d.marketAnalyses : [];
+    state.calendar = Object.assign({ todos: [], customHolidays: [] }, d.calendar || {});
+    if (d.v4Workspace && window.__ftLoadV4) window.__ftLoadV4(d.v4Workspace);
+    persistAll();
+    render();
+    return { ok: true, count: state.customers.length };
+  } catch (e) { return { ok: false, error: e.message || '恢复失败' }; }
+}
+function repairBrokenNoteArrays(customers) {
+  let repaired = 0;
+  (Array.isArray(customers) ? customers : []).forEach(c => {
+    if (!c || !Array.isArray(c.notes)) return;
+    const src = c.notes; const out = []; let run = []; let changed = false;
+    const flush = () => {
+      if (!run.length) return;
+      if (run.length >= 4) { changed = true; } // 旧版错误地把内部字符串 spread 成单字符数组，直接丢弃该垃圾段
+      else out.push(...run);
+      run = [];
+    };
+    src.forEach(n => {
+      if (typeof n === 'string' && n.length === 1) run.push(n);
+      else { flush(); out.push(n); }
+    });
+    flush();
+    if (changed) { c.notes = out; repaired++; }
+  });
+  return repaired;
+}
+window.__ftCreateSafetySnapshot = createSafetySnapshot;
 
 // =========================================================
 // 删除墓碑：本地删掉的客户，必须挡住云端旧记录被拉回来
@@ -3621,14 +3691,16 @@ function renderSettings() {
     </div>
     <!-- Supabase 免费云同步卡片（推荐，最简单） -->
     <div class="card card-pad" style="border:2px solid var(--success,#16a34a);border-left:6px solid var(--success,#16a34a)">
-      <div class="card-title">⚡ 多端实时同步（Supabase · 免费推荐）</div>
-      <div class="help" style="margin-bottom:12px"><b>手机 + 电脑实时同步，最简单方案。</b>免费注册 Supabase（supabase.com），新建项目后在控制台拿 2 个东西：<b>Project URL</b> 和 <b>anon public key</b>，填到下面点连接即可。首次还需在 Supabase 的 SQL Editor 运行一段建表脚本（见《Supabase接入指南》）。</div>
+      <div class="card-title">⚡ 多端实时同步（Supabase Free · V6.1 稳定版）</div>
+      <div class="help" style="margin-bottom:12px"><b>手机 + 电脑同步。</b>V6.1 会在打开工作台时自动恢复上次 Supabase 连接，并在云端异常时保护本地数据，不再把连接失败当成“空数据”。Supabase Free 长期低活跃仍可能暂停；可按《V6.1 Supabase Free稳定版接入指南》开启免费的 GitHub 定时保活。</div>
       <div class="field"><label>Project URL <span class="small muted">（如 https://xxxx.supabase.co）</span></label><input id="sb-url" type="text" value="${esc(window.__ftSupabaseCloud ? window.__ftSupabaseCloud.getConfig().url : '')}" placeholder="https://xxxx.supabase.co"></div>
       <div class="field"><label>anon public key <span class="small muted">（Project Settings → API → anon public）</span></label><input id="sb-key" type="text" value="${esc(window.__ftSupabaseCloud ? window.__ftSupabaseCloud.getConfig().key : '')}" placeholder="eyJhbGciOiJ..."></div>
       <div class="flex gap8 wrap mt8" style="margin-top:12px">
         <button class="btn primary" id="sb-connect">🔗 连接 Supabase</button>
         <button class="btn" id="sb-push">☝️ 上传到云端</button>
         <button class="btn" id="sb-pull">👇 从云端拉取</button>
+        <button class="btn" id="sb-health">🩺 健康检查</button>
+        <button class="btn" id="sb-restore-snapshot">↩️ 恢复安全快照</button>
         <button class="btn" id="sb-disconnect">断开</button>
       </div>
       <div id="sb-msg" class="help" style="margin-top:10px"></div>
@@ -3792,7 +3864,7 @@ function renderSettings() {
   });
 
   $('#st-export').addEventListener('click', async () => {
-    const data = { customers: state.customers, aiHistory: state.aiHistory, marketAnalyses: state.marketAnalyses, calendar: state.calendar, v4Workspace: (window.__ftV4 || null), exportedAt: nowISO(), _v: 4 };
+    const data = buildBackupPayload();
     const r = await exportDataWeb(data);
     if (r.ok) toast('已导出', r.filePath, 'ok');
     else if (!r.canceled) toast('导出失败', r.error || '', 'err');
@@ -3802,6 +3874,7 @@ function renderSettings() {
     const r = await importDataWeb();
     if (!r.ok) { if (!r.canceled) toast('导入失败', r.error || '', 'err'); return; }
     const d = r.data || {};
+    createSafetySnapshot('before_json_import');
     if (!Array.isArray(d.customers)) { toast('格式错误', '文件不包含 customers 数组', 'err'); return; }
     if (d.v4Workspace && window.__ftLoadV4) window.__ftLoadV4(d.v4Workspace);
     const beforeCount = state.customers.length;
@@ -3839,11 +3912,30 @@ function renderSettings() {
     });
     state.pendingDeletes = (state.pendingDeletes || []).filter(id => !reactivatedIds.has(id));
 
-    // “新增导入”只处理客户，不覆盖现有 AI 历史和市场分析。
+    // 日历/To-do 采用按 id 增量合并，备份恢复时不会覆盖现有任务。
+    let todoMerged = 0;
+    if (d.calendar && Array.isArray(d.calendar.todos)) {
+      const byId = new Map((state.calendar.todos || []).filter(Boolean).map(t => [t.id, t]));
+      d.calendar.todos.forEach(t => {
+        if (!t || !t.id) return;
+        const cur = byId.get(t.id);
+        if (!cur) { byId.set(t.id, t); todoMerged++; return; }
+        const ct = new Date(cur.updatedAt || cur.createdAt || 0).getTime();
+        const it = new Date(t.updatedAt || t.createdAt || 0).getTime();
+        if (it > ct) { byId.set(t.id, t); todoMerged++; }
+      });
+      state.calendar.todos = Array.from(byId.values());
+      const holMap = new Map((state.calendar.customHolidays || []).filter(Boolean).map(h => [h.id, h]));
+      (d.calendar.customHolidays || []).forEach(h => { if (h && h.id) holMap.set(h.id, h); });
+      state.calendar.customHolidays = Array.from(holMap.values());
+      state.calendar.updatedAt = nowISO();
+    }
+    // “新增导入”不覆盖现有 AI 历史和市场分析。
     persistAll();
     let msg = `新增 ${added} 个`;
     if (merged) msg += `，合并 ${merged} 个重复客户`;
     if (invalid) msg += `，跳过 ${invalid} 条无效数据`;
+    if (todoMerged) msg += `，合并 ${todoMerged} 条待办`;
     msg += `；当前共 ${state.customers.length} 个客户`;
     toast('导入完成', msg, 'ok');
     render();
@@ -4025,7 +4117,10 @@ function renderSettings() {
     cbMsgEl().innerHTML = '<span style="color:var(--muted)">⏳ 正在拉取…</span>';
     const r = await window.__ftCloud.pullAll();
     cbMsgEl().innerHTML = r.ok ? '<span style="color:var(--success)">✓ 已从云端拉取 ' + (r.count||0) + ' 个客户并合并</span>' : '<span style="color:var(--danger)">✗ ' + esc(r.error) + '</span>';
-    if (r.ok) { render(); }
+    // V6.1.1：设置页拉取成功后不再整页 render()。
+    // 数据已写入 state/localStorage，切换到 CRM/日历时会自然显示最新数据；
+    // 避免设置页滚动位置被重置，看起来像“页面刷新/跳页”。
+    if (r.ok) { updateCloudHealthBadge(); }
   });
   // 断开
   const cbDisc = $('#st-cb-disconnect');
@@ -4043,6 +4138,7 @@ function renderSettings() {
     const el = sbStatusEl(); if (!el) return;
     el.innerHTML = txt;
     el.style.color = type === 'ok' ? 'var(--success)' : type === 'err' ? 'var(--danger)' : 'var(--muted)';
+    try { updateCloudHealthBadge(); } catch (e) {}
   }
   if (window.__ftSupabaseCloud) {
     const st = window.__ftSupabaseCloud.getState();
@@ -4064,7 +4160,7 @@ function renderSettings() {
       if (r.ok) {
         window.__ftSupabaseCloud.startPolling();
         sbMsgEl().innerHTML = '<span style="color:var(--success)">✓ 已连接并完成首次同步！数据已上传云端，其他设备填同样的 URL+Key 后自动同步。</span>';
-        sbUiStatus(`✅ 已连接 · 上次同步：${window.__ftSupabaseCloud.getState().lastSync}`, 'ok');
+        sbUiStatus(`✅ 已连接 · 上次同步：${window.__ftSupabaseCloud.getState().lastSync}`, 'ok'); updateCloudHealthBadge();
       } else {
         sbMsgEl().innerHTML = '<span style="color:var(--danger)">✗ ' + esc(r.error || '连接失败') + '</span>';
         sbUiStatus(`⚠ 连接失败`, 'err');
@@ -4084,13 +4180,33 @@ function renderSettings() {
     sbMsgEl().innerHTML = '<span style="color:var(--muted)">⏳ 正在拉取…</span>';
     const r = await window.__ftSupabaseCloud.pullAll();
     sbMsgEl().innerHTML = r.ok ? '<span style="color:var(--success)">✓ 已从云端拉取 ' + (r.count||0) + ' 个客户并合并</span>' : '<span style="color:var(--danger)">✗ ' + esc(r.error) + '</span>';
-    if (r.ok) { render(); }
+    // V6.1.1：不要在设置页手动拉取后整页重绘。
+    // pullAll 已完成数据合并和持久化；页面重绘只会导致滚动条跳回顶部。
+    if (r.ok) {
+      const st = window.__ftSupabaseCloud.getState();
+      sbUiStatus(`✅ 已连接 · 上次同步：${st.lastSync || '刚刚'}`, 'ok');
+      updateCloudHealthBadge();
+    }
+  });
+  const sbHealth = $('#sb-health');
+  if (sbHealth) sbHealth.addEventListener('click', async () => {
+    if (!window.__ftSupabaseCloud) return;
+    sbMsgEl().innerHTML = '<span style="color:var(--muted)">⏳ 正在检查云端…</span>';
+    const r = await window.__ftSupabaseCloud.healthCheck();
+    sbMsgEl().innerHTML = r.ok ? '<span style="color:var(--success)">✓ 云端正常，本地数据安全</span>' : '<span style="color:var(--danger)">✗ ' + esc(r.error || '健康检查失败') + '；本地数据未受影响</span>';
+    updateCloudHealthBadge();
+  });
+  const sbRestore = $('#sb-restore-snapshot');
+  if (sbRestore) sbRestore.addEventListener('click', () => {
+    const r = restoreSafetySnapshot();
+    if (r.ok) toast('已恢复安全快照', `恢复 ${r.count} 个客户；尚未上传云端`, 'ok');
+    else if (!r.canceled) toast('无法恢复', r.error || '', 'err');
   });
   const sbDisc = $('#sb-disconnect');
   if (sbDisc) sbDisc.addEventListener('click', () => {
     if (window.__ftSupabaseCloud) window.__ftSupabaseCloud.disconnect();
     sbUiStatus('未连接', '');
-    sbMsgEl().innerHTML = '<span style="color:var(--muted)">已断开 Supabase</span>';
+    sbMsgEl().innerHTML = '<span style="color:var(--muted)">已断开 Supabase</span>'; updateCloudHealthBadge();
   });
   // 保存 WebDAV 配置到 settings
   const origSaveHandler = null; // we hook into st-save below
@@ -4100,6 +4216,28 @@ function renderSettings() {
 function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme === 'dark' ? 'dark' : 'light');
 }
+function updateCloudHealthBadge() {
+  const el = $('#cloud-health-badge'); if (!el) return;
+  const cfg = (window.__ftSupabaseCloud && window.__ftSupabaseCloud.getConfig) ? window.__ftSupabaseCloud.getConfig() : {};
+  const st = (window.__ftSupabaseCloud && window.__ftSupabaseCloud.getState) ? window.__ftSupabaseCloud.getState() : {};
+  el.className = 'cloud-health-badge';
+  if (st.connected) {
+    el.classList.add('ok');
+    const t = st.lastOkAt ? new Date(st.lastOkAt).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}) : (st.lastSync || '');
+    el.innerHTML = `☁️ 云端在线<span class="cloud-extra">${t ? ' · ' + esc(t) : ''}</span>`;
+    el.title = `Supabase 已连接。上次成功：${st.lastOkAt || st.lastSync || '—'}`;
+  } else if (cfg && cfg.url) {
+    el.classList.add(st.lastError ? 'err' : 'warn');
+    el.innerHTML = st.lastError ? '☁️ 云端异常' : '☁️ 待连接';
+    el.title = st.lastError || '已配置 Supabase，但当前未连接；V6.1 会自动重连。';
+  } else {
+    el.innerHTML = '☁️ 本地模式';
+    el.title = '尚未配置 Supabase';
+  }
+}
+window.__ftUpdateCloudBadge = updateCloudHealthBadge;
+window.addEventListener('ftw-supabase-status', () => { try { updateCloudHealthBadge(); } catch(e) {} });
+
 function updateAiStatus() {
   const el = $('#ai-status');
   if (!el) return;
@@ -4129,6 +4267,9 @@ async function init() {
   state.trash = loadLS(LS.trash, {}) || {};
   state.pendingDeletes = loadLS(LS.pendingDeletes, []) || [];
   if (!Array.isArray(state.pendingDeletes)) state.pendingDeletes = [];
+  // V6.1 一次性修复旧版本把 notes 字符串错误展开成单字符数组的问题。
+  const repairedNotes = repairBrokenNoteArrays(state.customers);
+  if (repairedNotes) { try { localStorage.setItem(V61_MIGRATION_KEY, String(repairedNotes)); } catch(e) {} persistAll(); }
   const pruned = pruneTombstones();
   // 墓碑里的客户一律不出现在列表里（含本轮刚清理前遗留的）
   const tombIds = Object.keys(state.tombstones);
@@ -4206,6 +4347,7 @@ async function init() {
   setTimeout(calCheckNotify, 800);
 
   render();
+  updateCloudHealthBadge();
 }
 
 document.addEventListener('DOMContentLoaded', init);

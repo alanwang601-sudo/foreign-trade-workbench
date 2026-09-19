@@ -109,6 +109,7 @@
 
   const SB_URL_KEY = 'sb_url';
   const SB_KEY_KEY = 'sb_key';
+  const SB_AUTO_KEY = 'sb_autoconnect_v61';
 
   function sbGetConfig() {
     return { url: localStorage.getItem(SB_URL_KEY) || '', key: localStorage.getItem(SB_KEY_KEY) || '' };
@@ -116,6 +117,7 @@
   function sbSaveConfig(url, key) {
     localStorage.setItem(SB_URL_KEY, url || '');
     localStorage.setItem(SB_KEY_KEY, key || '');
+    if (url && key) localStorage.setItem(SB_AUTO_KEY, '1');
   }
   function sbEngine() { return window.__ftSupabase || null; }
 
@@ -130,14 +132,19 @@
       if (!r.ok) return r;
       sbSyncState.connected = true;
       sbSyncState.url = cfg.url;
+      sbSyncState.lastError = '';
       window.__ftState = window.__ftState || getState();
-      // 首次连接必须先处理待删 + 拉取远端删除，再上传本地。
+      // 首次连接：先拉取并安全合并，再推送本地。任何一步失败都不宣告成功。
       if (window.__ftFlushDeletes) { try { await window.__ftFlushDeletes(); } catch (e) {} }
       const pull = await eng.pullAndMerge();
-      if (eng.fullPush) await eng.fullPush();
-      if (pull && pull.ok && window.__ftRefreshUI) window.__ftRefreshUI();
+      if (!pull || pull.ok !== true) throw new Error((pull && pull.error) || '首次拉取失败');
+      const push = eng.fullPush ? await eng.fullPush() : { ok: true };
+      if (!push || push.ok !== true) throw new Error((push && push.error) || '首次上传失败');
+      if (window.__ftRefreshUI) window.__ftRefreshUI();
       if (eng.startPolling) eng.startPolling();
-      sbSyncState.lastSync = new Date().toLocaleString('zh-CN');
+      const es = eng.getState ? eng.getState() : {};
+      sbSyncState.lastSync = es.lastSync || new Date().toLocaleString('zh-CN');
+      window.dispatchEvent(new CustomEvent('ftw-supabase-status', { detail: { ok: true, state: Object.assign({}, sbSyncState, es) } }));
       return { ok: true, mode: 'supabase' };
     } catch (e) {
       sbSyncState.connected = false;
@@ -145,7 +152,7 @@
       return { ok: false, error: sbSyncState.lastError };
     }
   }
-  function sbDisconnect() { const e = sbEngine(); if (e && e.disconnect) e.disconnect(); sbSyncState.connected = false; }
+  function sbDisconnect() { const e = sbEngine(); if (e && e.disconnect) e.disconnect(); sbSyncState.connected = false; localStorage.setItem(SB_AUTO_KEY, '0'); window.dispatchEvent(new CustomEvent('ftw-supabase-status', { detail: { ok: false, manual: true, state: sbSyncState } })); }
 
   window.__ftSupabaseCloud = {
     connect: sbConnect,
@@ -153,17 +160,19 @@
     pushAll: () => { const e = sbEngine(); return e && e.fullPush ? e.fullPush() : { ok: false, error: '未加载' }; },
     clearBusinessData: () => { const e = sbEngine(); return e && e.clearBusinessData ? e.clearBusinessData() : { ok: false, error: '未加载' }; },
     pullAll: () => { const e = sbEngine(); return e && e.pullAndMerge ? e.pullAndMerge() : { ok: false, error: '未加载' }; },
+    healthCheck: () => { const e = sbEngine(); return e && e.healthCheck ? e.healthCheck(false) : { ok: false, error: '未加载' }; },
     startPolling: () => { const e = sbEngine(); if (e && e.startPolling) e.startPolling(); },
     pushCalendar: () => pushCalendarVia(sbEngine()),
     pushSettings: () => pushSettingsVia(sbEngine()),
     onSettings: (fn) => { const e = sbEngine(); if (e && e.onSettings) e.onSettings(fn); },
     getConfig: sbGetConfig, saveConfig: sbSaveConfig,
-    getState: () => sbSyncState,
+    getState: () => { const e = sbEngine(); const es = e && e.getState ? e.getState() : {}; return Object.assign({}, sbSyncState, es); },
     onStatus: (fn) => { const e = sbEngine(); if (e && e.onStatus) e.onStatus(fn); }
   };
 
   // =====================================================
-  // 三、自动连接（仅 CloudBase；Supabase 由设置页手动连接）
+  // 三、自动连接：V6.1 会自动恢复上次 Supabase 连接。
+  // 旧版每次刷新都停留在“本地模式”，这是 Free 项目容易因低活跃被暂停的主要原因之一。
   // =====================================================
   document.addEventListener('DOMContentLoaded', () => {
     setTimeout(() => {
@@ -174,5 +183,15 @@
         });
       }
     }, 1500);
+    setTimeout(() => {
+      const cfg = sbGetConfig();
+      const auto = localStorage.getItem(SB_AUTO_KEY);
+      if (cfg.url && cfg.key && auto !== '0') {
+        sbConnect().then(r => {
+          const st = window.__ftSupabaseCloud.getState();
+          window.dispatchEvent(new CustomEvent('ftw-supabase-status', { detail: { ok: !!r.ok, auto: true, error: r.error || '', state: st } }));
+        });
+      }
+    }, 2200);
   });
 })();
