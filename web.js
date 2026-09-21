@@ -2817,6 +2817,7 @@ function ratingBadgeClass(g) { return 'g-' + String(g || '').replace(/\+/g, 'plu
 function openCustomerDetail(id) {
   const c = state.customers.find(x => x.id === id);
   if (!c) return;
+  const displayName = c.name || c.company_name || '未命名客户';
   const contacts = (c.contacts && c.contacts.length) ? c.contacts.slice().sort((a, b) => {
     const ord = { 'P1': 0, 'P2': 1, 'P3': 2 };
     return (ord[a.priority] != null ? ord[a.priority] : 9) - (ord[b.priority] != null ? ord[b.priority] : 9);
@@ -2860,7 +2861,7 @@ function openCustomerDetail(id) {
 
   showModal(`
     <div class="flex between items-center mb12">
-      <div><h3 style="font-size:18px;margin:0">${esc(c.name)}</h3>
+      <div><h3 style="font-size:18px;margin:0">${esc(displayName)}</h3>
         <div class="muted small mt8">${esc(c.country || '')} · ${esc(c.industry || '')} · 来源：${esc(c.source || '—')}</div></div>
       <div class="flex items-center gap8">
         ${custGrade(c) ? `<span class="badge b-rating">⭐ ${esc(custGrade(c))}</span>` : ''}
@@ -2938,7 +2939,14 @@ function openCustomerDetail(id) {
         <button class="btn danger" id="d-del">删除</button>
       </div>
     </div>
-  `, { title: '客户详情', foot: false, wide: true });
+  `, { title: `客户详情 · ${displayName}`, foot: false, wide: true });
+
+  // 每次打开客户详情都从顶部开始；同时公司名固定显示在弹窗标题栏，
+  // 即使用户向下滚动，也不会失去当前客户上下文。
+  requestAnimationFrame(() => {
+    const modalBody = $('#modal-root .modal-body');
+    if (modalBody) modalBody.scrollTop = 0;
+  });
 
   $('#d-addnote').addEventListener('click', () => {
     const txt = $('#d-note').value.trim();
