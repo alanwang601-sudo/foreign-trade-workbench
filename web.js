@@ -489,31 +489,122 @@ function findDupCustomer(name, website, shopUrl) {
   });
 }
 
-// JSON 追加导入时使用：保留现有 CRM 已维护内容，只补充新信息并合并数组字段。
-function mergeImportedCustomer(existing, incoming, importStamp) {
-  if (!existing || !incoming) return existing;
-  const protectedKeys = new Set(['id', 'createdAt', 'contacts', 'tags', 'notes', 'productMatches']);
+// JSON 导入归一化：兼容 ChatGPT / 工作台导出里常见的 snake_case / camelCase 字段。
+// 注意：只把能明确映射到工作台正式字段的别名同步过来；原始字段仍保留，便于追溯。
+function normalizeImportedCustomer(raw) {
+  const incoming = Object.assign({}, raw || {});
+  const copyIfUseful = (target, ...sources) => {
+    if (incoming[target] !== undefined && incoming[target] !== null && incoming[target] !== '') return;
+    for (const key of sources) {
+      const v = incoming[key];
+      if (v !== undefined && v !== null && v !== '') { incoming[target] = v; return; }
+    }
+  };
+  copyIfUseful('name', 'company_name', 'company');
+  copyIfUseful('country', 'country_region');
+  copyIfUseful('shopUrl', 'store_listing_url', 'storeUrl');
+  copyIfUseful('channel', 'source_channel');
+  copyIfUseful('lastFollowUp', 'last_followup_date', 'last_followup', 'recent_follow_up_date', 'recentFollowUpDate', 'last_contact_date', 'lastContactDate');
+  copyIfUseful('followUpEvery', 'followup_days', 'followUpDays');
+  copyIfUseful('devHook', 'development_hook', 'dev_hook');
+  copyIfUseful('devStrategy', 'development_strategy', 'dev_strategy');
+  copyIfUseful('nextAction', 'next_action', 'next_step');
+  copyIfUseful('customerGrade', 'customer_grade');
+  copyIfUseful('emailTracking', 'email_tracking');
+  copyIfUseful('activeKeywords', 'active_keywords');
+  copyIfUseful('productKeywords', 'product_keywords');
+  copyIfUseful('productMatches', 'product_matches');
+
+  // development_stage 只有在能映射到工作台正式阶段时才改 stage；
+  // “已读待回复/已发送待读取”这类邮件状态保留在原字段，不污染销售阶段。
+  if (!incoming.stage) {
+    const st = String(incoming.development_stage || incoming.developmentStage || '').trim();
+    const hit = STAGES.find(s => s === st || (st && st.includes(s)));
+    if (hit) incoming.stage = hit;
+  }
+  return incoming;
+}
+
+function importDateMs(v) {
+  if (!v) return 0;
+  const t = new Date(String(v).length === 10 ? String(v) + 'T00:00:00' : v).getTime();
+  return Number.isFinite(t) ? t : 0;
+}
+function importUseful(v) {
+  return !(v === undefined || v === null || v === '' || (Array.isArray(v) && !v.length));
+}
+function mergeImportedObject(oldObj, newObj, preferIncoming) {
+  if (!oldObj || typeof oldObj !== 'object' || Array.isArray(oldObj)) oldObj = {};
+  if (!newObj || typeof newObj !== 'object' || Array.isArray(newObj)) return oldObj;
+  const out = Object.assign({}, oldObj);
+  Object.keys(newObj).forEach(k => {
+    const nv = newObj[k];
+    if (!importUseful(nv)) return;
+    const ov = out[k];
+    if (preferIncoming || !importUseful(ov)) out[k] = nv;
+  });
+  return out;
+}
+function sameImportedContact(a, b) {
+  if (!a || !b) return false;
+  const ae = normKey(a.email), be = normKey(b.email);
+  const ap = normKey(a.phone || a.whatsapp), bp = normKey(b.phone || b.whatsapp);
+  const aw = normKey(a.whatsapp), bw = normKey(b.whatsapp);
+  const al = normKey(a.linkedin), bl = normKey(b.linkedin);
+  const an = normKey(a.name), bn = normKey(b.name);
+  if (ae && be && ae === be) return true;
+  if (aw && bw && aw === bw) return true;
+  if (ap && bp && ap === bp) return true;
+  if (al && bl && al === bl) return true;
+  return !!(an && bn && an === bn);
+}
+
+// JSON 追加/更新导入：
+// 1) 同 ID = 明确更新同一客户：允许刷新跟进日期、下一步、追踪、联系人补全等业务字段；
+// 2) 仅同公司名/网址命中 = 保守合并：默认不覆盖已有人工维护核心字段；
+// 3) 每次合并都刷新 updatedAt，确保 Supabase 能把这次更新真正同步到云端。
+function mergeImportedCustomer(existing, incomingRaw, importStamp, options = {}) {
+  if (!existing || !incomingRaw) return existing;
+  const incoming = normalizeImportedCustomer(incomingRaw);
+  const exactId = !!options.exactId;
+  const protectedKeys = new Set(['id', 'createdAt', 'contacts', 'tags', 'notes', 'productMatches', 'activeKeywords', 'productKeywords']);
+  const exactUpdateKeys = new Set([
+    'lastFollowUp', 'followUpEvery', 'devHook', 'devStrategy', 'nextAction',
+    'customerGrade', 'rating', 'emailTracking', 'email_tracking',
+    'development_stage', 'developmentStage', 'fit', 'fitReason', 'matchReason'
+  ]);
+
   Object.keys(incoming).forEach(k => {
     if (protectedKeys.has(k)) return;
     const oldVal = existing[k];
     const newVal = incoming[k];
-    // 默认不覆盖已经存在的人工维护内容；只填当前为空的字段。
-    const oldEmpty = oldVal === undefined || oldVal === null || oldVal === '' || (Array.isArray(oldVal) && !oldVal.length);
-    const newUseful = newVal !== undefined && newVal !== null && newVal !== '';
-    if (oldEmpty && newUseful) existing[k] = newVal;
+    const oldEmpty = !importUseful(oldVal);
+    const newUseful = importUseful(newVal);
+    if (!newUseful) return;
+
+    // lastFollowUp 只向前推进，不允许旧导入把最近跟进日期倒退。
+    if (k === 'lastFollowUp') {
+      const nt = importDateMs(newVal), ot = importDateMs(oldVal);
+      if (!ot || (nt && nt >= ot)) existing[k] = String(newVal).slice(0, 10);
+      return;
+    }
+
+    // 同 ID 代表用户明确要更新这条客户：业务状态字段以导入值为准；
+    // 普通同名去重仍维持“只补空缺”的保守策略。
+    if (exactId && exactUpdateKeys.has(k)) { existing[k] = newVal; return; }
+    if (oldEmpty) existing[k] = newVal;
   });
 
-  const contactKey = c => [normKey(c && c.email), normKey(c && c.phone), normKey(c && c.name), normKey(c && c.linkedin)].join('|');
-  const mergedContacts = [];
-  const seenContacts = new Set();
-  [...(existing.contacts || []), ...(incoming.contacts || [])].forEach(c => {
+  // 联系人按 email / WhatsApp / phone / LinkedIn / 姓名识别同一人；
+  // 同 ID 更新时用新信息补全/纠正旧联系人，避免“修正姓名/邮箱”后生成重复联系人。
+  const mergedContacts = (Array.isArray(existing.contacts) ? existing.contacts : []).map(c => Object.assign({}, c));
+  (Array.isArray(incoming.contacts) ? incoming.contacts : []).forEach(c => {
     if (!c || typeof c !== 'object') return;
-    const key = contactKey(c);
-    // 全空联系人不导入；有信息但 key 碰撞时保留现有版本。
-    if (!key.replace(/\|/g, '')) return;
-    if (seenContacts.has(key)) return;
-    seenContacts.add(key);
-    mergedContacts.push(c);
+    const hasIdentity = [c.email, c.phone, c.whatsapp, c.name, c.linkedin].some(importUseful);
+    if (!hasIdentity) return;
+    const idx = mergedContacts.findIndex(x => sameImportedContact(x, c));
+    if (idx >= 0) mergedContacts[idx] = mergeImportedObject(mergedContacts[idx], c, exactId);
+    else mergedContacts.push(Object.assign({}, c));
   });
   existing.contacts = mergedContacts;
 
@@ -529,6 +620,8 @@ function mergeImportedCustomer(existing, incoming, importStamp) {
   };
   existing.tags = mergePrimitiveArray(existing.tags, incoming.tags);
   existing.productMatches = mergePrimitiveArray(existing.productMatches, incoming.productMatches);
+  existing.activeKeywords = mergePrimitiveArray(existing.activeKeywords, incoming.activeKeywords);
+  existing.productKeywords = mergePrimitiveArray(existing.productKeywords, incoming.productKeywords);
 
   // 跟进备注采用追加，但避免完全相同的备注重复出现。
   const noteSeen = new Set();
@@ -539,8 +632,10 @@ function mergeImportedCustomer(existing, incoming, importStamp) {
     noteSeen.add(key); return true;
   });
 
+  // 关键修复：以前这里保留旧 updatedAt，导致本地合并后 Supabase 仍判断云端旧记录更新，
+  // 于是 lastFollowUp / 邮件状态等刚导入的变化会被旧云端值覆盖。
   existing._ftImportedAt = importStamp;
-  existing.updatedAt = existing.updatedAt || incoming.updatedAt || importStamp;
+  existing.updatedAt = importStamp;
   return existing;
 }
 
@@ -3669,11 +3764,11 @@ function renderSettings() {
       <div class="field"><label>客户数据</label>
         <div class="flex gap8 wrap">
           <button class="btn" id="st-export">导出 JSON</button>
-          <button class="btn" id="st-import">导入 JSON（新增）</button>
+          <button class="btn" id="st-import">导入 JSON（新增 / 更新）</button>
           <button class="btn" id="st-trash">🗑 回收站（${Object.keys(state.trash || {}).length}）</button>
           <button class="btn danger" id="st-clear">彻底清空全部</button>
         </div>
-        <div class="help" style="margin-top:6px">「导入 JSON（新增）」会保留当前客户，只追加新客户；同一公司会智能合并联系人、标签和空缺字段，不会整表覆盖。单个删除的客户会在回收站保留 30 天；「彻底清空全部」会同时清理已连接的 Supabase 数据，且不可恢复。</div>
+        <div class="help" style="margin-top:6px">「导入 JSON（新增 / 更新）」会保留当前客户：同 ID 视为明确更新，会刷新最近跟进、下一步、邮件追踪和联系人补全等业务字段；仅同公司名/网址命中时仍采用保守合并，不会整表覆盖。单个删除的客户会在回收站保留 30 天；「彻底清空全部」会同时清理已连接的 Supabase 数据，且不可恢复。</div>
       </div>
       <div class="divider"></div>
       <div class="field"><label>外观</label>
@@ -3886,7 +3981,7 @@ function renderSettings() {
     if (!Array.isArray(d.customers)) { toast('格式错误', '文件不包含 customers 数组', 'err'); return; }
     if (d.v4Workspace && window.__ftLoadV4) window.__ftLoadV4(d.v4Workspace);
     const beforeCount = state.customers.length;
-    if (!confirm(`将新增导入 ${d.customers.length} 个客户。\n当前已有 ${beforeCount} 个客户，原有客户不会被清空。\n若检测到同一公司，将智能合并而不是重复创建。\n\n确定继续？`)) return;
+    if (!confirm(`将导入 ${d.customers.length} 条客户数据。\n当前已有 ${beforeCount} 个客户，原有客户不会被清空。\n同 ID 将更新业务状态；同公司名/网址将智能合并，不会重复创建。\n\n确定继续？`)) return;
 
     // 追加导入：保留当前 CRM，只把新客户追加进来；同 ID / 同公司则智能合并。
     // 同时给本次导入打时间戳并撤销旧墓碑，确保重新上传 Supabase 时不会被历史清空标记误删。
@@ -3896,14 +3991,15 @@ function renderSettings() {
 
     d.customers.forEach(raw => {
       if (!raw || typeof raw !== 'object') { invalid++; return; }
-      const incoming = Object.assign({}, raw, { _ftImportedAt: importStamp });
+      const incoming = Object.assign(normalizeImportedCustomer(raw), { _ftImportedAt: importStamp });
       if (!incoming.id) incoming.id = uid();
 
-      let existing = state.customers.find(c => c && c.id === incoming.id);
+      const exactExisting = state.customers.find(c => c && c.id === incoming.id);
+      let existing = exactExisting;
       if (!existing) existing = findDupCustomer(incoming.name, incoming.website, incoming.shopUrl);
 
       if (existing) {
-        mergeImportedCustomer(existing, incoming, importStamp);
+        mergeImportedCustomer(existing, incoming, importStamp, { exactId: !!exactExisting });
         reactivatedIds.add(existing.id);
         merged++;
       } else {
