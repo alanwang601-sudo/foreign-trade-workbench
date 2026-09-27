@@ -427,13 +427,14 @@ function ratingDays(rating) {
   const s = (state.settings && state.settings.ratingDays) || {};
   return s[rating] != null ? s[rating] : (RATING_DAYS_DEFAULT[rating] || 0);
 }
-// 客户最后一次跟进日期（没有跟进记录则用创建日期兜底）
+// 客户最后一次【实际跟进】日期。
+// 重要：createdAt 只是“建档日期”，不能当作“已跟进日期”。
+// 新录入但从未触达的客户，lastFollowUp 为空，应立即进入“需跟进 / 从未跟进”。
 function lastTouchDate(c) {
   if (c.lastFollowUp && /^\d{4}-\d{2}-\d{2}/.test(c.lastFollowUp)) return c.lastFollowUp.slice(0, 10);
-  if (c.createdAt && /^\d{4}-\d{2}-\d{2}/.test(c.createdAt)) return c.createdAt.slice(0, 10);
   return null;
 }
-// 距离上次跟进已过去多少天（从未跟进过返回 9999，保证任何阈值都能筛出来）
+// 距离上次实际跟进已过去多少天（从未跟进过返回 9999，保证任何阈值都能筛出来）
 function daysSinceLastFollow(c) {
   const base = lastTouchDate(c);
   if (!base) return 9999;
