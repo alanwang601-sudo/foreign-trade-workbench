@@ -410,6 +410,7 @@ function fmtDate(d) {
 function fmtNum(n) { return (Number(n) || 0).toLocaleString('zh-CN'); }
 
 // ---------- 跟进提醒 ----------
+const FOLLOWUP_UI_FIX_VERSION = '2026-09-27-never-contacted-v2';
 function toDateStr(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
@@ -433,6 +434,11 @@ function ratingDays(rating) {
 function lastTouchDate(c) {
   if (c.lastFollowUp && /^\d{4}-\d{2}-\d{2}/.test(c.lastFollowUp)) return c.lastFollowUp.slice(0, 10);
   return null;
+}
+// 明确区分“从未触达”和“从未跟进”。
+// 新名片客户会写入 contact_status=not_contacted / contacted=false / isContacted=false。
+function isNeverContacted(c) {
+  return c.contact_status === 'not_contacted' || c.contacted === false || c.isContacted === false || c.postShowOutreach === false;
 }
 // 距离上次实际跟进已过去多少天（从未跟进过返回 9999，保证任何阈值都能筛出来）
 function daysSinceLastFollow(c) {
@@ -2419,7 +2425,7 @@ function renderCrmTable() {
         <td><span class="badge ${STAGE_CLASS[c.stage] || 'b-tag'}">${esc(c.stage)}</span>${c.cooperating ? ` <span class="badge b-coop">🤝</span>` : ''}${c.fit ? ` <span class="badge ${fitClass(c.fit)}">${esc(c.fit)}</span>` : ''}</td>
         <td>${c.value ? fmtNum(c.value) : '—'}</td>
         <td>${esc(c.owner || '—')}</td>
-        <td>${esc(c.lastFollowUp || '—')}<div class="small mt4 ${idle >= 30 ? 'muted' : ''}">${idle >= 9999 ? '<span class="muted">从未跟进</span>' : `<span class="muted">${idle} 天没跟</span>`}</div>${fu.next ? `<div class="small muted mt4">下次 ${fu.next}</div>` : ''}</td>
+        <td>${esc(c.lastFollowUp || '—')}<div class="small mt4 muted">${isNeverContacted(c) ? '<span>从未跟进 · 从未触达</span>' : (idle >= 9999 ? '<span>从未跟进</span>' : `<span>${idle} 天没跟</span>`)}</div>${(!isNeverContacted(c) && fu.next) ? `<div class="small muted mt4">下次 ${fu.next}</div>` : ''}</td>
         <td class="text-right nowrap">
           ${due ? `<button class="btn sm primary" data-act="follow">已跟进</button>` : ''}
           <button class="btn sm" data-act="view">查看</button>
@@ -2978,8 +2984,8 @@ function openCustomerDetail(id) {
       <span class="k">负责人</span><span>${esc(c.owner || '—')}</span>
       <span class="k">客户评级</span><span>${custGrade(c) ? `<span class="badge b-rating">⭐ ${esc(custGrade(c))}</span> <span class="muted small">（每 ${ratingDays(custGrade(c))} 天跟进）</span>` : '<span class="muted">未评级</span>'}</span>
       <span class="k">预估价值</span><span>${c.value ? fmtNum(c.value) : '—'}</span>
-      <span class="k">最近跟进</span><span>${esc(c.lastFollowUp || '—')}</span>
-      <span class="k">下次跟进</span><span>${isFollowUpDue(c) ? `<span class="badge b-due">🔔 需跟进${followUpInfo(c).daysOverdue ? ' · 逾期 ' + followUpInfo(c).daysOverdue + ' 天' : ''}</span>` : (followUpInfo(c).next ? esc(followUpInfo(c).next) : '—')}</span>
+      <span class="k">最近跟进</span><span>${isNeverContacted(c) ? '从未跟进 / 从未触达' : esc(c.lastFollowUp || '—')}</span>
+      <span class="k">下次跟进</span><span>${isNeverContacted(c) ? '<span class="badge b-due">🔔 待首次触达</span>' : (isFollowUpDue(c) ? `<span class="badge b-due">🔔 需跟进${followUpInfo(c).daysOverdue ? ' · 逾期 ' + followUpInfo(c).daysOverdue + ' 天' : ''}</span>` : (followUpInfo(c).next ? esc(followUpInfo(c).next) : '—'))}</span>
       <span class="k">创建时间</span><span>${fmtDate(c.createdAt)}</span>
     </div>
     ${c.tags && c.tags.length ? `<div class="pill-list mt12">${c.tags.map(t => `<span class="chip">${esc(t)}</span>`).join('')}</div>` : ''}
