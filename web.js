@@ -3224,7 +3224,11 @@ function calDayItems(y, m, d) {
   // Todo：按日期匹配（date 字段为 YYYY-MM-DD），不含已完成的
   (state.calendar.todos || []).forEach(t => {
     if (t.date && t.date.slice(0,10) === dateStr) {
-      items.push({ type: 'todo', text: t.text, id: t.id, done: !!t.done, prio: t.prio || 0 });
+      items.push({
+        type: 'todo', text: t.text, id: t.id, done: !!t.done, prio: t.prio || 0,
+        note: t.note || '', custId: t.custId || '', custName: t.custName || '',
+        date: t.date || '', createdAt: t.createdAt || '', updatedAt: t.updatedAt || ''
+      });
     }
   });
   return items;
@@ -3345,7 +3349,7 @@ function renderCalendar() {
 
   main.innerHTML = `
   <div class="page-head">
-    <div><h2>日历</h2><div class="sub">目标市场节日问候 + Todo 待办提醒</div></div>
+    <div><h2>日历</h2><div class="sub">目标市场节日问候 + Todo 待办提醒 <span style="font-size:10px;opacity:.55">TaskDetail V3</span></div></div>
     <div class="flex gap8">
       <button class="btn primary" id="cal-add-todo">+ 添加待办</button>
       <button class="btn" id="cal-add-holiday">+ 自定义节日</button>
@@ -3489,16 +3493,72 @@ function openCalDay(dateStr) {
     <div class="cal-day-row">${h.emoji || '🎉'} <b>${esc(h.name)}</b> <span class="muted small">${esc(h.regions || '')}</span>
       <div class="small muted">${esc(h.note || '')}${h.note && h.note.includes('预计') ? ' — 请核对当年日期' : ''}</div>
     </div>`).join('') || '<div class="empty small">当天无节日</div>';
-  const todoRows = items.filter(i => i.type === 'todo').map(t => `
-    <div class="cal-day-row">${t.done ? '✅' : '📌'} <b>${esc(t.text)}</b> <span class="small ${t.prio ? 'warn' : 'muted'}">${t.prio === 1 ? '重要' : t.prio === 2 ? '紧急' : ''}</span></div>`).join('') || '<div class="empty small">当天无待办</div>';
+  const todoRows = items.filter(i => i.type === 'todo').map(t => {
+    const prioText = t.prio === 2 ? '紧急' : t.prio === 1 ? '重要' : '普通';
+    const statusText = t.done ? '已完成' : '待处理';
+    const custHtml = t.custId
+      ? `<button class="btn sm ghost cal-day-cust" data-cust="${esc(t.custId)}">👤 ${esc(t.custName || '查看客户')}</button>`
+      : '<span class="small muted">未关联客户</span>';
+    const noteHtml = t.note
+      ? `<div style="margin-top:8px;padding:9px 11px;background:var(--bg-soft,#f6f7f9);border-radius:8px;white-space:pre-wrap;line-height:1.55"><span class="small muted">备注</span><div>${esc(t.note)}</div></div>`
+      : '<div class="small muted" style="margin-top:7px">备注：无</div>';
+    return `
+      <div class="cal-day-row cal-day-todo-card" data-task-id="${esc(t.id)}" style="display:block;padding:12px 12px;border:1px solid var(--border);border-radius:10px;margin:8px 0;cursor:pointer;background:var(--card,#fff)" title="点击查看/编辑任务详情">
+        <div style="display:flex;gap:8px;align-items:flex-start;justify-content:space-between">
+          <div style="min-width:0;flex:1">
+            <div style="font-weight:700;line-height:1.5;white-space:normal;word-break:break-word">${t.done ? '✅' : '📌'} ${esc(t.text)}</div>
+            <div class="small muted" style="margin-top:5px">状态：${statusText} · 优先级：${prioText} · 日期：${esc((t.date || dateStr).slice(0,10))}</div>
+          </div>
+        </div>
+        <div style="margin-top:8px">${custHtml}</div>
+        ${noteHtml}
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+          <button class="btn sm primary cal-day-detail" data-id="${esc(t.id)}">查看详情</button>
+          <button class="btn sm cal-day-edit" data-id="${esc(t.id)}">编辑任务</button>
+          ${!t.done ? `<button class="btn sm cal-day-done" data-id="${esc(t.id)}">标记完成</button>` : ''}
+        </div>
+      </div>`;
+  }).join('') || '<div class="empty small">当天无待办</div>';
   showModal(`<div class="cal-day">
     <div class="cal-day-section"><div class="card-title" style="margin-bottom:8px">🎉 节日</div>${holRows}</div>
-    <div class="cal-day-section"><div class="card-title" style="margin-bottom:8px">📌 待办</div>${todoRows}
+    <div class="cal-day-section"><div class="card-title" style="margin-bottom:8px">📌 待办详情</div>${todoRows}
       <button class="btn sm mt8" id="cal-day-add-todo">+ 给这天添加待办</button>
     </div>
   </div>`, { title: dateLabel, foot: false });
   $all('[data-close]').forEach(b => b.addEventListener('click', closeModal));
   $('#cal-day-add-todo').addEventListener('click', () => { closeModal(); calAddTodo(dateStr); });
+  // 点击任务卡片任意位置，直接打开该任务的编辑/详情弹窗（按钮和客户按钮除外）
+  $all('.cal-day-todo-card').forEach(card => card.addEventListener('click', (e) => {
+    if (e.target.closest('button,a,input,label')) return;
+    const id = card.dataset.taskId;
+    if (!id) return;
+    closeModal(); calAddTodo(dateStr, id);
+  }));
+  $all('.cal-day-detail').forEach(b => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const id = b.dataset.id;
+    if (!id) return;
+    closeModal();
+    calAddTodo(dateStr, id);
+  }));
+  $all('.cal-day-edit').forEach(b => b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const id = b.dataset.id; closeModal(); calAddTodo(dateStr, id);
+  }));
+  $all('.cal-day-cust').forEach(b => b.addEventListener('click', () => {
+    const c = (state.customers || []).find(x => x.id === b.dataset.cust);
+    if (!c) return;
+    closeModal(); state.view = 'crm'; state.selectedCustomer = c.id; render(); setTimeout(() => openCustomer(c.id), 0);
+  }));
+  $all('.cal-day-done').forEach(b => b.addEventListener('click', () => {
+    const t = (state.calendar.todos || []).find(x => x.id === b.dataset.id);
+    if (!t) return;
+    t.done = true; t.completedAt = nowISO(); t.updatedAt = nowISO();
+    if (t.custId && !t.custNotedAt) noteTodoToCustomer(t);
+    persistAll(); syncCal();
+    closeModal(); renderCalendar();
+    toast('待办已完成', t.text, 'ok');
+  }));
 }
 
 // 添加/编辑待办弹窗
