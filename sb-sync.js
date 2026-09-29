@@ -201,7 +201,7 @@
       const records = (Array.isArray(rows) ? rows : []).map(row => {
         let obj = {};
         try { obj = typeof row.data === 'string' ? JSON.parse(row.data) : (row.data || {}); } catch (e) {}
-        return { id: row.id, updatedAt: row.updated_at || obj.updatedAt || '', ...obj };
+        return { ...obj, id: row.id, updatedAt: row.updated_at || obj.updatedAt || '' };
       });
       return { ok: true, records };
     } catch (e) {
