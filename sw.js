@@ -1,6 +1,6 @@
 /* 外贸工作台 Web 版 Service Worker
  * 提供离线缓存，让"添加到主屏幕"的 App 在无网络时也能打开 */
-const CACHE = 'ftw-cache-v29-calendar-sync-fix';
+const CACHE = 'ftw-cache-v30-calendar-merge-fix';
 const ASSETS = [
   './',
   './index.html',
