@@ -201,7 +201,7 @@
       const records = (Array.isArray(rows) ? rows : []).map(row => {
         let obj = {};
         try { obj = typeof row.data === 'string' ? JSON.parse(row.data) : (row.data || {}); } catch (e) {}
-        return { ...obj, id: row.id, updatedAt: row.updated_at || obj.updatedAt || '' };
+        return { id: row.id, updatedAt: row.updated_at || obj.updatedAt || '', ...obj };
       });
       return { ok: true, records };
     } catch (e) {
@@ -265,8 +265,6 @@
   }
 
   // ---------- 日历安全合并 ----------
-  // 规则：云端独有、本地独有都保留；同 id 时优先 todo 自身 updatedAt 更新者。
-  // 旧任务常没有 updatedAt，此时用日历顶层 updatedAt 判断，避免旧 localStorage 覆盖新云端。
   function mergeCalendarSafe(localCal, cloudCal) {
     const local = Object.assign({ todos: [], customHolidays: [] }, localCal || {});
     const cloud = Object.assign({ todos: [], customHolidays: [] }, cloudCal || {});
@@ -333,18 +331,114 @@
         const msg = `${failedCustomers.length} 个客户上传失败，请检查 Supabase 权限/网络后重试`; noteFailure(msg); return { ok: false, error: msg, failed: failedCustomers };
       }
       if (st.calendar) {
-        // 日历不能直接用本机整包覆盖云端：先拉取云端并按 todo id 合并，
-        // 防止另一设备/ChatGPT 新增的任务被旧 localStorage 吞掉。
         const calRes = await pullTable('calendar');
+        if (!calRes.ok) throw new Error('calendar 拉取失败：' + (calRes.error || '未知错误'));
+        const cloudRec = Array.isArray(calRes.records) ? calRes.records.find(r => r.id === 'ftw_calendar') : null;
+        st.calendar = mergeCalendarSafe(st.calendar, cloudRec || { todos: [], customHolidays: [] });
+        const calRec = Object.assign({}, st.calendar, { updatedAt: new Date().toISOString() });
+        st.calendar.updatedAt = calRec.updatedAt;
+        if (typeof window.__ftPersistState === 'function') { try { window.__ftPersistState(); } catch (e) {} }
+        const cr = await upsertRecord('calendar', 'ftw_calendar', calRec);
+        if (!cr.ok) throw new Error('日历上传失败：' + (cr.error || '未知错误'));
+      }
+      if (st.settings) {
+        const setRec = Object.assign({ updatedAt: new Date().toISOString() }, safeSettingsForCloud(st.settings));
+        const sr = await upsertRecord('settings', 'ftw_settings', setRec); if (!sr.ok) throw new Error('设置上传失败：' + (sr.error || '未知错误'));
+      }
+      SB.lastSync = new Date().toLocaleString('zh-CN');
+      noteSuccess();
+      status('已上传 ' + (st.customers || []).length + ' 个客户', 'ok');
+      return { ok: true };
+    } catch (e) {
+      const msg = friendlyNetworkError(e) || '同步失败'; noteFailure(msg); return { ok: false, error: msg };
+    }
+  }
+
+  // ---------- 拉取并合并 ----------
+  async function pullAndMerge() {
+    if (!SB.connected) return { ok: false, error: '未连接' };
+    const st = getState();
+    if (typeof window.__ftCreateSafetySnapshot === 'function') { try { window.__ftCreateSafetySnapshot('before_supabase_pull'); } catch (e) {} }
+    try {
+      for (const key of ['customers', 'aiHistory', 'marketAnalyses']) {
+        const res = await pullTable(key);
+        if (!res.ok) throw new Error(`${key} 拉取失败：${res.error || '未知错误'}`);
+        if (Array.isArray(res.records)) {
+          if (key === 'customers') {
+            const tombs = st.tombstones || {};
+            const allRemote = res.records || [];
+            const clearMarker = allRemote.find(c => c && c.id === META_CLEAR_ID && c._ftMeta === 'customersCleared');
+            const deleteMarkers = allRemote.filter(c => c && String(c.id || '').startsWith(META_DELETE_PREFIX) && c._ftMeta === 'customerDeleted');
+            const remoteCustomers = allRemote.filter(c => c && !String(c.id || '').startsWith('__ft_'));
+
+            // 先应用云端删除控制记录，再做普通合并。
+            deleteMarkers.forEach(m => {
+              if (m.targetId) tombs[m.targetId] = m.deletedAt || m.updatedAt || new Date().toISOString();
+            });
+            if (clearMarker) {
+              const ct = new Date(clearMarker.clearedAt || clearMarker.updatedAt || 0).getTime();
+              if (ct) {
+                (st.customers || []).forEach(c => {
+                  if (!c || !c.id) return;
+                  // 全量清空是显式的全局操作：凡是在清空时间之前存在的本地客户都应删除，
+                  // 不依赖旧版本是否带 syncedAt。只有清空之后真正新建/修改的记录才保留。
+                  const t = customerClock(c);
+                  if (!t || t <= ct + 1000) tombs[c.id] = clearMarker.clearedAt || clearMarker.updatedAt;
+                });
+              }
+            }
+
+            // 墓碑判定：本地/云端已删掉的客户，旧记录不许复活
+            const isDead = (id, rec) => {
+              if (!id || !tombs[id]) return false;
+              const t = new Date(tombs[id] || 0).getTime();
+              if (!t) return false;
+              const rt = (rec && typeof rec === 'object') ? customerClock(rec) : new Date(rec || 0).getTime();
+              if (!rt) return true;
+              return t >= rt - 1000;
+            };
+
+            // 兼容旧版本没有云端 tombstone 的删除：云端存在其他真实客户时，缺失的已同步客户视为远端删除。
+            const cloudIds = new Set(remoteCustomers.map(c => c.id).filter(Boolean));
+            if (remoteCustomers.length > 0) {
+              const nowIso = new Date().toISOString();
+              const gone = (st.customers || []).filter(c => c.id && !cloudIds.has(c.id) && c.syncedAt && !tombs[c.id]);
+              if (gone.length && gone.length <= 100) {
+                gone.forEach(c => { tombs[c.id] = nowIso; });
+                if (typeof window.__ftOnRemoteDelete === 'function') {
+                  try { window.__ftOnRemoteDelete(gone.map(c => c.name || c.id)); } catch (e) {}
+                }
+              }
+            }
+
+            const localMap = new Map((st.customers || []).map(c => [c.id, c]));
+            remoteCustomers.forEach(c => {
+              if (!c.id) return;
+              if (isDead(c.id, c)) return;
+              if (localMap.has(c.id)) {
+                const t1 = new Date(localMap.get(c.id).updatedAt || 0).getTime();
+                const t2 = new Date(c.updatedAt || 0).getTime();
+                localMap.set(c.id, t2 >= t1 ? c : localMap.get(c.id));
+              } else localMap.set(c.id, c);
+            });
+            // 若云端有一条比墓碑更新的记录，说明它被明确恢复/重新发布，撤掉旧墓碑。
+            remoteCustomers.forEach(c => {
+              if (c && c.id && tombs[c.id] && !isDead(c.id, c)) delete tombs[c.id];
+            });
+            st.customers = Array.from(localMap.values()).filter(c => !isDead(c.id, c));
+            if (typeof window.__ftPersistState === 'function') { try { window.__ftPersistState(); } catch (e) {} }
+          } else {
+            st[key] = mergeRecordsById(st[key] || [], res.records || []);
+          }
+        }
+      }
+      const calRes = await pullTable('calendar');
       if (!calRes.ok) throw new Error('calendar 拉取失败：' + (calRes.error || '未知错误'));
       if (Array.isArray(calRes.records) && calRes.records.length) {
         const calRec = calRes.records.find(r => r.id === 'ftw_calendar');
-        if (calRec) {
-          // 不再依赖单一顶层 updatedAt 决定“整包采纳/整包忽略”。
-          // 始终按任务 id 合并，保证云端新增任务即使本机时间戳较新也不会消失。
-          st.calendar = mergeCalendarSafe(st.calendar || { todos: [], customHolidays: [] }, calRec);
-        }
+        if (calRec) st.calendar = mergeCalendarSafe(st.calendar || { todos: [], customHolidays: [] }, calRec);
       }
+      if (typeof window.__ftPersistState === 'function') { try { window.__ftPersistState(); } catch (e) {} }
       const setRes = await pullTable('settings');
       if (!setRes.ok) throw new Error('settings 拉取失败：' + (setRes.error || '未知错误'));
       if (Array.isArray(setRes.records) && setRes.records.length) {
@@ -360,11 +454,9 @@
           }
         }
       }
-      // 拉取合并后必须写回 localStorage；否则刷新页面又会加载旧本地日历。
-      if (typeof window.__ftPersistState === 'function') { try { window.__ftPersistState(); } catch (e) {} }
       SB.lastSync = new Date().toLocaleString('zh-CN');
       noteSuccess();
-      return { ok: true, count: st.customers.length, calendarTodos: (st.calendar && st.calendar.todos || []).length };
+      return { ok: true, count: st.customers.length };
     } catch (e) {
       const msg = friendlyNetworkError(e) || '拉取失败'; noteFailure(msg); return { ok: false, error: msg };
     }
@@ -404,16 +496,13 @@
       if (isBusy()) return;
       // 补推离线期间删掉的客户（断网时删除没能通知云端，联网后在这里补删）
       if (window.__ftFlushDeletes) { try { await window.__ftFlushDeletes(); } catch (e) {} }
-      // 先拉云端再推本地，避免旧 localStorage 在轮询第一步覆盖云端新任务。
       const before = fingerprint();
       const r = await pullAndMerge();
       if (!r.ok) { status(r.error || '云端同步失败，本地数据已保留', 'err'); return; }
       const afterPull = fingerprint();
       const localChanged = before !== SB.lastFingerprint;
       const remoteChanged = afterPull !== before;
-      if (localChanged || remoteChanged) {
-        try { await fullPush(); } catch (e) {}
-      }
+      if (localChanged || remoteChanged) { try { await fullPush(); } catch (e) {} }
       SB.lastFingerprint = fingerprint();
       if (window.__ftRefreshUI) window.__ftRefreshUI();
     }, ms);

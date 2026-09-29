@@ -1,0 +1,17 @@
+外贸工作台 日历云同步修复补丁
+
+只需要覆盖仓库根目录的 2 个文件：
+1. sb-sync.js
+2. sw.js
+
+修复点：
+- 修复 Supabase 拉取时 JSON 内旧 updatedAt 覆盖数据库 updated_at 的问题。
+- 以后数据库 calendar.updated_at 更新后，前端会正确判定云端更新更“新”，从而拉取新任务。
+- Service Worker 核心 JS/HTML 改为 network-first，避免 GitHub Pages 更新后仍长期执行旧缓存代码。
+
+建议部署顺序：
+1. 关闭工作台页面。
+2. 将这两个文件覆盖到 GitHub Pages 仓库根目录。
+3. 等 GitHub Pages 部署完成。
+4. 重新打开工作台，Ctrl+F5 一次。
+5. 确认顶部为“云端在线”。
